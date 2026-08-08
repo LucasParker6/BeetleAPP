@@ -1,0 +1,5 @@
+pandas
+Pillow
+qrcode
+streamlit
+altair
