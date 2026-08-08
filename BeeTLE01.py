@@ -2,7 +2,6 @@ import io
 import json
 import base64
 import smtplib
-import sqlite3
 from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 import pandas as pd
@@ -10,18 +9,21 @@ from PIL import Image
 import qrcode
 import streamlit as st
 import altair as alt
+from supabase import create_client, Client
 
 # ==========================================
-# 1. 資料庫初始化與結構自動修復機制
+# 1. Supabase 連線初始化
 # ==========================================
-DB_FILE = "beetle_tracker.db"
+# 使用 cache_resource 避免每次頁面重新整理時都重複建立連線
+@st.cache_resource
+def init_supabase() -> Client:
+    # 讀取 secrets 中的設定 (.streamlit/secrets.toml)
+    url = st.secrets["supabase"]["SUPABASE_URL"]
+    key = st.secrets["supabase"]["SUPABASE_KEY"]
+    return create_client(url, key)
 
-
-def get_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# 初始化 supabase 物件（全域可用）
+supabase = init_supabase()
 
 BACKUP_TABLES = [
     "beetles",
@@ -34,7 +36,9 @@ BACKUP_REQUIRED_TABLES = [
     table_name for table_name in BACKUP_TABLES if table_name != "beetle_images"
 ]
 
-
+# ==========================================
+# 2. Supabase 資料庫操作與備份機制
+# ==========================================
 def create_backup_payload():
     """建立包含所有系統資料的 JSON 備份內容。"""
     payload = {
@@ -43,24 +47,15 @@ def create_backup_payload():
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "tables": {},
     }
-    with get_connection() as conn:
-        for table_name in BACKUP_TABLES:
-            rows = conn.execute(f'SELECT * FROM "{table_name}"').fetchall()
-            records = []
-            for row in rows:
-                record = dict(row)
-                if table_name == "beetle_images" and record.get("image_data"):
-                    record["image_data"] = base64.b64encode(
-                        record["image_data"]
-                    ).decode("ascii")
-                    record["image_data_encoding"] = "base64"
-                records.append(record)
-            payload["tables"][table_name] = records
+    for table_name in BACKUP_TABLES:
+        res = supabase.table(table_name).select("*").execute()
+        records = res.data if res.data else []
+        payload["tables"][table_name] = records
     return payload
 
 
 def restore_backup_payload(payload):
-    """驗證並以交易方式還原完整 JSON 備份。"""
+    """驗證並還原完整 JSON 備份至 Supabase。"""
     if not isinstance(payload, dict):
         raise ValueError("備份格式無效。")
     if payload.get("format") != "beetle_tracker_backup":
@@ -74,60 +69,33 @@ def restore_backup_payload(payload):
     if missing_tables:
         raise ValueError(f"備份缺少資料表：{', '.join(missing_tables)}")
 
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        try:
-            for table_name in BACKUP_TABLES:
-                columns = [
-                    row[1]
-                    for row in cursor.execute(
-                        f'PRAGMA table_info("{table_name}")'
-                    ).fetchall()
-                ]
-                table_records = payload["tables"].get(table_name, [])
-                if not isinstance(table_records, list):
-                    raise ValueError(f"資料表 {table_name} 格式無效。")
-                cursor.execute(f'DELETE FROM "{table_name}"')
-                for record in table_records:
-                    if not isinstance(record, dict):
-                        raise ValueError(f"資料表 {table_name} 含有無效資料列。")
-                    record_columns = [
-                        column for column in record if column in columns
-                    ]
-                    if not record_columns:
-                        continue
-                    record_values = [record[column] for column in record_columns]
-                    if (
-                        table_name == "beetle_images"
-                        and record.get("image_data_encoding") == "base64"
-                        and "image_data" in record_columns
-                    ):
-                        data_index = record_columns.index("image_data")
-                        record_values[data_index] = base64.b64decode(
-                            record_values[data_index]
-                        )
-                    placeholders = ", ".join("?" for _ in record_columns)
-                    column_sql = ", ".join(
-                        f'"{column}"' for column in record_columns
-                    )
-                    cursor.execute(
-                        f'INSERT INTO "{table_name}" ({column_sql}) VALUES ({placeholders})',
-                        record_values,
-                    )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+    try:
+        # 清空所有表（注意外鍵順序）
+        for table_name in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles"]:
+            supabase.table(table_name).delete().neq("id" if table_name in ["logs", "beetle_images", "notification_settings"] else ("slot" if table_name == "notification_recipients" else "beetle_code"), "___dummy___").execute()
+        
+        for table_name in BACKUP_TABLES:
+            records = payload["tables"].get(table_name, [])
+            if records:
+                # 若為自增主鍵的 Log 或 Image，移除 id 讓 PostgreSQL 自動算號
+                if table_name in ["logs", "beetle_images"]:
+                    for r in records:
+                        r.pop("id", None)
+                supabase.table(table_name).insert(records).execute()
+    except Exception as ex:
+        raise ValueError(f"還原時發生錯誤：{ex}")
 
 
 def get_pending_maintenance_records():
     """取得目前需要換土或維護的個體清單。"""
     today = date.today()
-    with get_connection() as conn:
-        df_beetles = pd.read_sql_query("SELECT * FROM beetles", conn)
-        df_logs = pd.read_sql_query("SELECT * FROM logs", conn)
+    res_b = supabase.table("beetles").select("*").execute()
+    res_l = supabase.table("logs").select("*").execute()
+    
+    df_beetles = pd.DataFrame(res_b.data if res_b.data else [])
+    df_logs = pd.DataFrame(res_l.data if res_l.data else [])
 
-    if "beetle_code" not in df_beetles.columns or df_beetles.empty:
+    if df_beetles.empty or "beetle_code" not in df_beetles.columns:
         return []
 
     df_valid = df_beetles[
@@ -155,7 +123,7 @@ def get_pending_maintenance_records():
             )
 
         maintenance_logs = b_logs
-        if "maintenance_type" in maintenance_logs.columns:
+        if not maintenance_logs.empty and "maintenance_type" in maintenance_logs.columns:
             maintenance_logs = maintenance_logs[
                 maintenance_logs["maintenance_type"] == "維護"
             ]
@@ -191,10 +159,10 @@ def get_pending_maintenance_records():
                         else "未曾紀錄"
                     ),
                     "最新體長 (mm)": (
-                        last_length if pd.notnull(last_length) else "-"
+                        last_length if pd.notnull(last_length) and last_length is not None else "-"
                     ),
                     "最新體重 (g)": (
-                        last_weight if pd.notnull(last_weight) else "-"
+                        last_weight if pd.notnull(last_weight) and last_weight is not None else "-"
                     ),
                 }
             )
@@ -204,8 +172,8 @@ def get_pending_maintenance_records():
 def send_notification_email(settings, recipients, pending_list):
     """透過 SMTP 寄送待換土通知。"""
     message = EmailMessage()
-    message["Subject"] = settings["subject"] or "甲蟲換土/維護提醒"
-    message["From"] = settings["sender_email"] or settings["smtp_username"]
+    message["Subject"] = settings.get("subject") or "甲蟲換土/維護提醒"
+    message["From"] = settings.get("sender_email") or settings.get("smtp_username")
     message["To"] = ", ".join(recipients)
 
     lines = [
@@ -222,11 +190,11 @@ def send_notification_email(settings, recipients, pending_list):
         )
     message.set_content("\n".join(lines))
 
-    if settings["smtp_ssl"]:
+    if settings.get("smtp_ssl"):
         with smtplib.SMTP_SSL(
             settings["smtp_host"], int(settings["smtp_port"]), timeout=20
         ) as smtp:
-            if settings["smtp_username"]:
+            if settings.get("smtp_username"):
                 smtp.login(settings["smtp_username"], settings["smtp_password"])
             smtp.send_message(message)
     else:
@@ -234,215 +202,95 @@ def send_notification_email(settings, recipients, pending_list):
             settings["smtp_host"], int(settings["smtp_port"]), timeout=20
         ) as smtp:
             smtp.starttls()
-            if settings["smtp_username"]:
+            if settings.get("smtp_username"):
                 smtp.login(settings["smtp_username"], settings["smtp_password"])
             smtp.send_message(message)
 
 
 def init_db():
-    """自動檢查資料庫結構，若缺少核心 beetle_code 欄位則安全重置重建"""
-    with get_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='beetles'"
-        )
-        table_exists = cursor.fetchone()
-
-        if table_exists:
-            cursor.execute("PRAGMA table_info(beetles)")
-            cols = [row[1] for row in cursor.fetchall()]
-            if "beetle_code" not in cols:
-                cursor.execute("DROP TABLE beetles")
-                cursor.execute("DROP TABLE IF EXISTS logs")
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS beetles (
-                beetle_code TEXT PRIMARY KEY,
-                custom_id TEXT NOT NULL,
-                species TEXT NOT NULL,
-                gender TEXT DEFAULT '未確定',
-                origin TEXT,
-                acquisition_source TEXT,
-                initial_stage TEXT,
-                current_stage TEXT DEFAULT '卵',
-                hatch_date TEXT,
-                parents_info TEXT,
-                generation TEXT,
-                lineage TEXT,
-                father_id TEXT,
-                mother_id TEXT,
-                notes TEXT,
-                custom_maintenance_days INTEGER DEFAULT 60,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """
-        )
-
-        cursor.execute("PRAGMA table_info(beetles)")
-        beetle_cols = [row[1] for row in cursor.fetchall()]
-        if "acquisition_source" not in beetle_cols:
-            cursor.execute(
-                "ALTER TABLE beetles ADD COLUMN acquisition_source TEXT"
-            )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                beetle_code TEXT NOT NULL,
-                entry_date TEXT NOT NULL,
-                length_mm REAL,
-                weight_g REAL,
-                substrate_type TEXT,
-                container_size_ml INTEGER,
-                notes TEXT,
-                maintenance_type TEXT DEFAULT '一般紀錄'
-            )
-        """
-        )
-        cursor.execute("PRAGMA table_info(logs)")
-        log_cols = [row[1] for row in cursor.fetchall()]
-        if "maintenance_type" not in log_cols:
-            cursor.execute(
-                "ALTER TABLE logs ADD COLUMN maintenance_type TEXT DEFAULT '一般紀錄'"
-            )
-            cursor.execute(
-                """
-                UPDATE logs
-                SET maintenance_type='維護'
-                WHERE notes LIKE '%換土%'
-                   OR notes LIKE '%換菌%'
-                   OR notes LIKE '%轉木屑%'
-                """
-            )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notification_settings (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER NOT NULL DEFAULT 0,
-                notification_days INTEGER NOT NULL DEFAULT 1,
-                smtp_host TEXT NOT NULL DEFAULT '',
-                smtp_port INTEGER NOT NULL DEFAULT 587,
-                smtp_ssl INTEGER NOT NULL DEFAULT 0,
-                smtp_username TEXT NOT NULL DEFAULT '',
-                smtp_password TEXT NOT NULL DEFAULT '',
-                sender_email TEXT NOT NULL DEFAULT '',
-                subject TEXT NOT NULL DEFAULT '甲蟲換土/維護提醒',
-                last_sent_at TEXT
-            )
-            """
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO notification_settings (id) VALUES (1)"
-        )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS notification_recipients (
-                slot INTEGER PRIMARY KEY,
-                email TEXT NOT NULL DEFAULT '',
-                enabled INTEGER NOT NULL DEFAULT 1
-            )
-            """
-        )
-        for slot in range(1, 11):
-            cursor.execute(
-                "INSERT OR IGNORE INTO notification_recipients (slot) VALUES (?)",
-                (slot,),
-            )
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS beetle_images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                beetle_code TEXT NOT NULL,
-                file_name TEXT NOT NULL,
-                mime_type TEXT NOT NULL,
-                image_data BLOB NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.commit()
+    """初始化 Supabase 基礎設定 (如 notification_settings 預設列)"""
+    # 確保 notification_settings 有 ID=1 預設列
+    res = supabase.table("notification_settings").select("*").eq("id", 1).execute()
+    if not res.data:
+        supabase.table("notification_settings").insert({
+            "id": 1,
+            "enabled": 0,
+            "notification_days": 1,
+            "smtp_host": "",
+            "smtp_port": 587,
+            "smtp_ssl": 0,
+            "smtp_username": "",
+            "smtp_password": "",
+            "sender_email": "",
+            "subject": "甲蟲換土/維護提醒"
+        }).execute()
+    
+    # 確保 notification_recipients 有 1~10 Slot
+    res_rec = supabase.table("notification_recipients").select("slot").execute()
+    existing_slots = [r["slot"] for r in res_rec.data] if res_rec.data else []
+    missing_slots = [{"slot": s, "email": "", "enabled": 1} for s in range(1, 11) if s not in existing_slots]
+    if missing_slots:
+        supabase.table("notification_recipients").insert(missing_slots).execute()
 
 
 def seed_sample_data():
     """載入測試範例資料"""
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM beetles")
-        if cursor.fetchone()[0] == 0:
-            today = date.today()
-            sample_beetles = [
-                (
-                    "2026-DHH-01",
-                    "DHH-M01",
-                    "赫克力士長角大カブト",
-                    "公",
-                    "瓜地馬拉",
-                    "自繁",
-                    "一齡幼蟲",
-                    "三齡幼蟲",
-                    "2025-08-15",
-                    "170mm極太系",
-                    "CBF1",
-                    "極太血統",
-                    "F-170",
-                    "M-075",
-                    "吃食量大，食痕正常",
-                    60,
-                ),
-                (
-                    "2026-彩虹-01",
-                    "RB-01",
-                    "彩虹鍬形蟲",
-                    "母",
-                    "澳洲昆士蘭",
-                    "購入",
-                    "卵",
-                    "二齡幼蟲",
-                    "2025-11-01",
-                    "綠彩自留",
-                    "WF2",
-                    "綠彩系",
-                    "RB-F02",
-                    "RB-M01",
-                    "狀態安定",
-                    45,
-                ),
-            ]
-            cursor.executemany(
-                """
-                INSERT INTO beetles (
-                    beetle_code, custom_id, species, gender, origin, acquisition_source, initial_stage, 
-                    current_stage, hatch_date, parents_info, generation, lineage, 
-                    father_id, mother_id, notes, custom_maintenance_days
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                sample_beetles,
-            )
+    res = supabase.table("beetles").select("beetle_code", count="exact").execute()
+    if res.count == 0 or len(res.data) == 0:
+        today = date.today()
+        sample_beetles = [
+            {
+                "beetle_code": "2026-DHH-01",
+                "custom_id": "DHH-M01",
+                "species": "赫克力士長角大カブト",
+                "gender": "公",
+                "origin": "瓜地馬拉",
+                "acquisition_source": "自繁",
+                "initial_stage": "一齡幼蟲",
+                "current_stage": "三齡幼蟲",
+                "hatch_date": "2025-08-15",
+                "parents_info": "170mm極太系",
+                "generation": "CBF1",
+                "lineage": "極太血統",
+                "father_id": "F-170",
+                "mother_id": "M-075",
+                "notes": "吃食量大，食痕正常",
+                "custom_maintenance_days": 60,
+            },
+            {
+                "beetle_code": "2026-彩虹-01",
+                "custom_id": "RB-01",
+                "species": "彩虹鍬形蟲",
+                "gender": "母",
+                "origin": "澳洲昆士蘭",
+                "acquisition_source": "購入",
+                "initial_stage": "卵",
+                "current_stage": "二齡幼蟲",
+                "hatch_date": "2025-11-01",
+                "parents_info": "綠彩自留",
+                "generation": "WF2",
+                "lineage": "綠彩系",
+                "father_id": "RB-F02",
+                "mother_id": "RB-M01",
+                "notes": "狀態安定",
+                "custom_maintenance_days": 45,
+            },
+        ]
+        supabase.table("beetles").insert(sample_beetles).execute()
 
-            d1 = (today - timedelta(days=90)).strftime("%Y-%m-%d")
-            d2 = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        d1 = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+        d2 = (today - timedelta(days=30)).strftime("%Y-%m-%d")
 
-            sample_logs = [
-                ("2026-DHH-01", d1, 35.0, 45.2, "大夢培植菌瓶", 1400, "換土", "維護"),
-                ("2026-DHH-01", d2, 65.0, 88.5, "二次發酵木屑", 2000, "轉木屑", "維護"),
-                ("2026-彩虹-01", d1, 12.0, 5.5, "高發酵木屑", 500, "換菌", "維護"),
-            ]
-            cursor.executemany(
-                """
-                INSERT INTO logs (beetle_code, entry_date, length_mm, weight_g, substrate_type, container_size_ml, notes, maintenance_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                sample_logs,
-            )
-            conn.commit()
+        sample_logs = [
+            {"beetle_code": "2026-DHH-01", "entry_date": d1, "length_mm": 35.0, "weight_g": 45.2, "notes": "換土", "maintenance_type": "維護"},
+            {"beetle_code": "2026-DHH-01", "entry_date": d2, "length_mm": 65.0, "weight_g": 88.5, "notes": "轉木屑", "maintenance_type": "維護"},
+            {"beetle_code": "2026-彩虹-01", "entry_date": d1, "length_mm": 12.0, "weight_g": 5.5, "notes": "換菌", "maintenance_type": "維護"},
+        ]
+        supabase.table("logs").insert(sample_logs).execute()
 
 
 # ==========================================
-# 2. QR Code 生成工具
+# 3. QR Code 生成工具
 # ==========================================
 def generate_qrcode(beetle_data: dict) -> Image.Image:
     """生成包含甲蟲資料的 QR Code 圖檔"""
@@ -459,7 +307,7 @@ def generate_qrcode(beetle_data: dict) -> Image.Image:
 
 
 # ==========================================
-# 3. Streamlit 主程式介面
+# 4. Streamlit 主程式介面
 # ==========================================
 st.set_page_config(
     page_title="甲蟲專業飼育紀錄系統",
@@ -562,14 +410,9 @@ if st.session_state.confirm_clear_database:
     st.sidebar.warning("此操作會刪除所有個體、成長紀錄與通知設定，確定要繼續嗎？")
     confirm_col1, confirm_col2 = st.sidebar.columns(2)
     if confirm_col1.button("確認清空", type="primary"):
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM beetles")
-            cursor.execute("DELETE FROM logs")
-            cursor.execute("DELETE FROM notification_settings")
-            cursor.execute("DELETE FROM notification_recipients")
-            cursor.execute("DELETE FROM beetle_images")
-            conn.commit()
+        for t in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles"]:
+            supabase.table(t).delete().neq("id" if t in ["logs", "beetle_images", "notification_settings"] else ("slot" if t == "notification_recipients" else "beetle_code"), "___dummy___").execute()
+        
         st.session_state.confirm_clear_database = False
         st.sidebar.success("資料庫已全數清空！")
         st.rerun()
@@ -583,9 +426,11 @@ if st.session_state.confirm_clear_database:
 if menu == "全場總覽與待換土提醒":
     st.title("全場總覽與待換土提醒")
 
-    with get_connection() as conn:
-        df_beetles = pd.read_sql_query("SELECT * FROM beetles", conn)
-        df_logs = pd.read_sql_query("SELECT * FROM logs", conn)
+    res_b = supabase.table("beetles").select("*").execute()
+    res_l = supabase.table("logs").select("*").execute()
+    
+    df_beetles = pd.DataFrame(res_b.data if res_b.data else [])
+    df_logs = pd.DataFrame(res_l.data if res_l.data else [])
 
     if "beetle_code" in df_beetles.columns and not df_beetles.empty:
         df_valid = df_beetles[
@@ -643,7 +488,7 @@ if menu == "全場總覽與待換土提醒":
                     "entry_date", ascending=False
                 )
             maintenance_logs = b_logs
-            if "maintenance_type" in maintenance_logs.columns:
+            if not maintenance_logs.empty and "maintenance_type" in maintenance_logs.columns:
                 maintenance_logs = maintenance_logs[
                     maintenance_logs["maintenance_type"] == "維護"
                 ]
@@ -684,10 +529,10 @@ if menu == "全場總覽與待換土提醒":
                             else "未曾紀錄"
                         ),
                         "最新體長 (mm)": (
-                            last_length if pd.notnull(last_length) else "-"
+                            last_length if pd.notnull(last_length) and last_length is not None else "-"
                         ),
                         "最新體重 (g)": (
-                            last_weight if pd.notnull(last_weight) else "-"
+                            last_weight if pd.notnull(last_weight) and last_weight is not None else "-"
                         ),
                     }
                 )
@@ -710,9 +555,11 @@ if menu == "全場總覽與待換土提醒":
 elif menu == "個體清單與檔案管理":
     st.title("個體清單與檔案管理")
 
-    with get_connection() as conn:
-        df_beetles = pd.read_sql_query("SELECT * FROM beetles", conn)
-        df_logs = pd.read_sql_query("SELECT * FROM logs", conn)
+    res_b = supabase.table("beetles").select("*").execute()
+    res_l = supabase.table("logs").select("*").execute()
+
+    df_beetles = pd.DataFrame(res_b.data if res_b.data else [])
+    df_logs = pd.DataFrame(res_l.data if res_l.data else [])
 
     if "beetle_code" in df_beetles.columns and not df_beetles.empty:
         df_valid = df_beetles[
@@ -789,17 +636,6 @@ elif menu == "個體清單與檔案管理":
         available_cols = [
             c for c in target_display_cols if c in df_valid.columns
         ]
-
-        col_names = {
-            "beetle_code": "個體編號",
-            "custom_id": "ID",
-            "species": "物種",
-            "gender": "性別",
-            "acquisition_source": "取得來源",
-            "current_stage": "當前階段",
-            "lineage": "血統",
-            "hatch_date": "孵化/採收日期",
-        }
 
         st.markdown("### 個體操作選項")
         page_size = 10
@@ -888,7 +724,6 @@ elif menu == "個體清單與檔案管理":
 
         @st.dialog("個體操作")
         def render_action_dialog():
-            # 當前的操作對象資訊
             active_code = st.session_state.get("edit_target_code")
             matching_beetles = df_valid[df_valid["beetle_code"] == active_code]
 
@@ -936,7 +771,6 @@ elif menu == "個體清單與檔案管理":
                     )
                     st.write(f"**備註:** {selected_info.get('notes') or '無'}")
 
-                    # 顯示成長歷史紀錄（唯讀）
                     b_logs = pd.DataFrame()
                     if not df_logs.empty and "beetle_code" in df_logs.columns:
                         b_logs = df_logs[
@@ -962,7 +796,6 @@ elif menu == "個體清單與檔案管理":
                 elif st.session_state.get("current_action") == "edit":
                     st.subheader(f"編輯個體資料：{active_code}")
 
-                    # 提取當前 Log 歷史紀錄
                     b_logs_list = []
                     if not df_logs.empty and "beetle_code" in df_logs.columns:
                         b_logs_list = (
@@ -971,7 +804,6 @@ elif menu == "個體清單與檔案管理":
                             .to_dict("records")
                         )
 
-                    # 防呆：確保編輯數量至少為 1
                     if st.session_state.edit_log_rows < 1:
                         st.session_state.edit_log_rows = max(1, len(b_logs_list))
 
@@ -1170,7 +1002,6 @@ elif menu == "個體清單與檔案管理":
 
                         st.markdown("---")
 
-                        # ========== 調整按鈕位置至此處（儲存按鈕上方） ==========
                         row_c1, row_c2, _ = st.columns([2, 2, 6])
                         btn_add_log = row_c1.form_submit_button(
                             "新增紀錄", type="secondary"
@@ -1183,7 +1014,6 @@ elif menu == "個體清單與檔案管理":
                             "儲存所有修改", type="primary"
                         )
 
-                        # 動態列數邏輯處理
                         if btn_add_log:
                             st.session_state.edit_log_rows += 1
                             st.rerun()
@@ -1193,7 +1023,6 @@ elif menu == "個體清單與檔案管理":
                                 st.session_state.edit_log_rows -= 1
                                 st.rerun()
 
-                        # 儲存邏輯處理
                         if btn_save:
                             if (
                                 not edit_beetle_code
@@ -1205,86 +1034,55 @@ elif menu == "個體清單與檔案管理":
                                 )
                             else:
                                 try:
-                                    conn = get_connection()
-                                    cursor = conn.cursor()
+                                    update_payload = {
+                                        "beetle_code": edit_beetle_code,
+                                        "custom_id": edit_custom_id,
+                                        "species": edit_species,
+                                        "gender": edit_gender,
+                                        "origin": edit_origin,
+                                        "acquisition_source": edit_acquisition_source,
+                                        "initial_stage": edit_initial_stage,
+                                        "current_stage": edit_stage,
+                                        "hatch_date": edit_hatch_date.strftime("%Y-%m-%d"),
+                                        "parents_info": edit_parents_info,
+                                        "generation": edit_generation,
+                                        "lineage": edit_lineage,
+                                        "father_id": edit_father_id,
+                                        "mother_id": edit_mother_id,
+                                        "notes": edit_notes,
+                                        "custom_maintenance_days": edit_m_days,
+                                    }
+                                    
+                                    supabase.table("beetles").update(update_payload).eq("beetle_code", active_code).execute()
 
-                                    # 更新主表
-                                    cursor.execute(
-                                        """
-                                        UPDATE beetles 
-                                        SET beetle_code=?, custom_id=?, species=?, gender=?, origin=?, acquisition_source=?, 
-                                            initial_stage=?, current_stage=?, hatch_date=?, parents_info=?, 
-                                            generation=?, lineage=?, father_id=?, mother_id=?, notes=?, 
-                                            custom_maintenance_days=?
-                                        WHERE beetle_code=?
-                                    """,
-                                        (
-                                            edit_beetle_code,
-                                            edit_custom_id,
-                                            edit_species,
-                                            edit_gender,
-                                            edit_origin,
-                                            edit_acquisition_source,
-                                            edit_initial_stage,
-                                            edit_stage,
-                                            edit_hatch_date.strftime("%Y-%m-%d"),
-                                            edit_parents_info,
-                                            edit_generation,
-                                            edit_lineage,
-                                            edit_father_id,
-                                            edit_mother_id,
-                                            edit_notes,
-                                            edit_m_days,
-                                            active_code,
-                                        ),
-                                    )
-
-                                    # 清除舊 Log 並寫入修改後的 Log 數據
-                                    cursor.execute(
-                                        "DELETE FROM logs WHERE beetle_code=?",
-                                        (edit_beetle_code,),
-                                    )
+                                    # 重寫 logs
+                                    supabase.table("logs").delete().eq("beetle_code", active_code).execute()
                                     if edit_beetle_code != active_code:
-                                        cursor.execute(
-                                            "DELETE FROM logs WHERE beetle_code=?",
-                                            (active_code,),
-                                        )
+                                        supabase.table("logs").delete().eq("beetle_code", edit_beetle_code).execute()
 
+                                    logs_to_insert = []
                                     for elog in edited_logs:
                                         if (
                                             elog["length"]
                                             or elog["weight"]
                                             or elog["notes"]
                                         ):
-                                            cursor.execute(
-                                                """
-                                                INSERT INTO logs (beetle_code, entry_date, length_mm, weight_g, notes, maintenance_type)
-                                                VALUES (?, ?, ?, ?, ?, ?)
-                                            """,
-                                                (
-                                                    edit_beetle_code,
-                                                    elog["date"],
-                                                    elog["length"],
-                                                    elog["weight"],
-                                                    elog["notes"],
-                                                    "維護" if elog["maintenance"] else "一般紀錄",
-                                                ),
-                                            )
+                                            logs_to_insert.append({
+                                                "beetle_code": edit_beetle_code,
+                                                "entry_date": elog["date"],
+                                                "length_mm": elog["length"],
+                                                "weight_g": elog["weight"],
+                                                "notes": elog["notes"],
+                                                "maintenance_type": "維護" if elog["maintenance"] else "一般紀錄",
+                                            })
+                                    if logs_to_insert:
+                                        supabase.table("logs").insert(logs_to_insert).execute()
 
-                                    conn.commit()
-                                    conn.close()
-
-                                    st.session_state.edit_target_code = (
-                                        edit_beetle_code
-                                    )
+                                    st.session_state.edit_target_code = edit_beetle_code
                                     st.session_state.current_action = "view"
                                     st.success("資料與成長紀錄修改成功並已儲存！")
                                     st.rerun()
 
-                                except sqlite3.IntegrityError:
-                                    st.error(
-                                        f"儲存失敗：個體編號 `{edit_beetle_code}` 已存在或有重複資料！"
-                                    )
                                 except Exception as ex:
                                     st.error(f"資料庫更新發生錯誤：{ex}")
 
@@ -1300,71 +1098,71 @@ elif menu == "個體清單與檔案管理":
                     if b_logs.empty:
                         st.warning("該個體尚未新增任何成長紀錄，無法產生曲線。")
                     else:
-                            b_logs["entry_date"] = pd.to_datetime(b_logs["entry_date"])
-                            b_logs = b_logs.sort_values("entry_date")
+                        b_logs["entry_date"] = pd.to_datetime(b_logs["entry_date"])
+                        b_logs = b_logs.sort_values("entry_date")
 
-                            chart_col1, chart_col2 = st.columns(2)
-                            with chart_col1:
-                                st.markdown("#### 秤重趨勢 (g)")
-                                if (
-                                    "weight_g" not in b_logs.columns
-                                    or b_logs["weight_g"].dropna().empty
-                                ):
-                                    st.caption("無體重數據")
-                                else:
-                                    df_w = b_logs[["entry_date", "weight_g"]].dropna()
-                                    line_w = (
-                                        alt.Chart(df_w)
-                                        .mark_line(interpolate="monotone", point=False)
-                                        .encode(
-                                            x=alt.X("entry_date:T", title="日期"),
-                                            y=alt.Y("weight_g:Q", title="體重 (g)"),
-                                            tooltip=[
-                                                alt.Tooltip("entry_date:T", title="日期"),
-                                                alt.Tooltip("weight_g:Q", title="體重 (g)"),
-                                            ],
-                                        )
-                                    )
-                                    points_w = alt.Chart(df_w).mark_point(size=40).encode(
-                                        x="entry_date:T",
-                                        y="weight_g:Q",
+                        chart_col1, chart_col2 = st.columns(2)
+                        with chart_col1:
+                            st.markdown("#### 秤重趨勢 (g)")
+                            if (
+                                "weight_g" not in b_logs.columns
+                                or b_logs["weight_g"].dropna().empty
+                            ):
+                                st.caption("無體重數據")
+                            else:
+                                df_w = b_logs[["entry_date", "weight_g"]].dropna()
+                                line_w = (
+                                    alt.Chart(df_w)
+                                    .mark_line(interpolate="monotone", point=False)
+                                    .encode(
+                                        x=alt.X("entry_date:T", title="日期"),
+                                        y=alt.Y("weight_g:Q", title="體重 (g)"),
                                         tooltip=[
                                             alt.Tooltip("entry_date:T", title="日期"),
                                             alt.Tooltip("weight_g:Q", title="體重 (g)"),
                                         ],
                                     )
-                                    st.altair_chart((line_w + points_w).properties(height=300), use_container_width=True)
+                                )
+                                points_w = alt.Chart(df_w).mark_point(size=40).encode(
+                                    x="entry_date:T",
+                                    y="weight_g:Q",
+                                    tooltip=[
+                                        alt.Tooltip("entry_date:T", title="日期"),
+                                        alt.Tooltip("weight_g:Q", title="體重 (g)"),
+                                    ],
+                                )
+                                st.altair_chart((line_w + points_w).properties(height=300), use_container_width=True)
 
-                            with chart_col2:
-                                st.markdown("#### 體長趨勢 (mm)")
-                                if (
-                                    "length_mm" not in b_logs.columns
-                                    or b_logs["length_mm"].dropna().empty
-                                ):
-                                    st.caption("無體長數據")
-                                else:
-                                    df_l = b_logs[["entry_date", "length_mm"]].dropna()
-                                    line_l = (
-                                        alt.Chart(df_l)
-                                        .mark_line(interpolate="monotone", point=False)
-                                        .encode(
-                                            x=alt.X("entry_date:T", title="日期"),
-                                            y=alt.Y("length_mm:Q", title="體長 (mm)"),
-                                            tooltip=[
-                                                alt.Tooltip("entry_date:T", title="日期"),
-                                                alt.Tooltip("length_mm:Q", title="體長 (mm)"),
-                                            ],
-                                        )
-                                    )
-                                    points_l = alt.Chart(df_l).mark_point(size=40).encode(
-                                        x="entry_date:T",
-                                        y="length_mm:Q",
+                        with chart_col2:
+                            st.markdown("#### 體長趨勢 (mm)")
+                            if (
+                                "length_mm" not in b_logs.columns
+                                or b_logs["length_mm"].dropna().empty
+                            ):
+                                st.caption("無體長數據")
+                            else:
+                                df_l = b_logs[["entry_date", "length_mm"]].dropna()
+                                line_l = (
+                                    alt.Chart(df_l)
+                                    .mark_line(interpolate="monotone", point=False)
+                                    .encode(
+                                        x=alt.X("entry_date:T", title="日期"),
+                                        y=alt.Y("length_mm:Q", title="體長 (mm)"),
                                         tooltip=[
                                             alt.Tooltip("entry_date:T", title="日期"),
                                             alt.Tooltip("length_mm:Q", title="體長 (mm)"),
                                         ],
                                     )
-                                    st.altair_chart((line_l + points_l).properties(height=300), use_container_width=True)
+                                )
+                                points_l = alt.Chart(df_l).mark_point(size=40).encode(
+                                    x="entry_date:T",
+                                    y="length_mm:Q",
+                                    tooltip=[
+                                        alt.Tooltip("entry_date:T", title="日期"),
+                                        alt.Tooltip("length_mm:Q", title="體長 (mm)"),
+                                    ],
+                                )
+                                st.altair_chart((line_l + points_l).properties(height=300), use_container_width=True)
 
                 # 4. QR Code
                 elif st.session_state.get("current_action") == "qr":
@@ -1415,40 +1213,25 @@ elif menu == "個體清單與檔案管理":
                         disabled=not uploaded_images,
                         key=f"upload_images_{active_code}_{image_upload_version}",
                     ):
-                        with get_connection() as conn:
-                            conn.executemany(
-                                """
-                                INSERT INTO beetle_images
-                                (beetle_code, file_name, mime_type, image_data)
-                                VALUES (?, ?, ?, ?)
-                                """,
-                                [
-                                    (
-                                        active_code,
-                                        image.name,
-                                        image.type or "application/octet-stream",
-                                        image.getvalue(),
-                                    )
-                                    for image in uploaded_images
-                                ],
-                            )
-                            conn.commit()
+                        new_imgs = []
+                        for img in uploaded_images:
+                            # 轉為 Base64 存入 PostgreSQL
+                            b64 = base64.b64encode(img.getvalue()).decode("ascii")
+                            new_imgs.append({
+                                "beetle_code": active_code,
+                                "file_name": img.name,
+                                "mime_type": img.type or "application/octet-stream",
+                                "image_data": b64
+                            })
+                        supabase.table("beetle_images").insert(new_imgs).execute()
                         st.session_state[image_upload_version_key] = (
                             image_upload_version + 1
                         )
                         st.session_state[image_upload_success_key] = True
                         st.rerun()
 
-                    with get_connection() as conn:
-                        image_rows = conn.execute(
-                            """
-                            SELECT id, file_name, mime_type, image_data, created_at
-                            FROM beetle_images
-                            WHERE beetle_code=?
-                            ORDER BY id DESC
-                            """,
-                            (active_code,),
-                        ).fetchall()
+                    res_img = supabase.table("beetle_images").select("*").eq("beetle_code", active_code).order("id", desc=True).execute()
+                    image_rows = res_img.data if res_img.data else []
 
                     if not image_rows:
                         st.info("目前尚未上傳圖片。")
@@ -1456,8 +1239,14 @@ elif menu == "個體清單與檔案管理":
                         st.markdown(f"目前共有 {len(image_rows)} 張圖片")
                         for image_row in image_rows:
                             image_col, delete_col = st.columns([4, 1])
+                            # 還原 Base64 圖片
+                            try:
+                                img_bytes = base64.b64decode(image_row["image_data"])
+                            except Exception:
+                                img_bytes = image_row["image_data"]
+                                
                             image_col.image(
-                                image_row["image_data"],
+                                img_bytes,
                                 caption=image_row["file_name"],
                                 width=260,
                             )
@@ -1465,12 +1254,7 @@ elif menu == "個體清單與檔案管理":
                                 "刪除圖片",
                                 key=f"delete_image_{active_code}_{image_row['id']}",
                             ):
-                                with get_connection() as conn:
-                                    conn.execute(
-                                        "DELETE FROM beetle_images WHERE id=? AND beetle_code=?",
-                                        (image_row["id"], active_code),
-                                    )
-                                    conn.commit()
+                                supabase.table("beetle_images").delete().eq("id", image_row["id"]).execute()
                                 st.rerun()
 
                 # 6. 刪除個體
@@ -1479,21 +1263,10 @@ elif menu == "個體清單與檔案管理":
                         f"確定要刪除個體 {active_code} 及其所有履歷資料嗎？"
                     )
                     if st.button("確認刪除！", type="primary"):
-                        with get_connection() as conn:
-                            cursor = conn.cursor()
-                            cursor.execute(
-                                "DELETE FROM beetles WHERE beetle_code = ?",
-                                (active_code,),
-                            )
-                            cursor.execute(
-                                "DELETE FROM logs WHERE beetle_code = ?",
-                                (active_code,),
-                            )
-                            cursor.execute(
-                                "DELETE FROM beetle_images WHERE beetle_code = ?",
-                                (active_code,),
-                            )
-                            conn.commit()
+                        supabase.table("beetles").delete().eq("beetle_code", active_code).execute()
+                        supabase.table("logs").delete().eq("beetle_code", active_code).execute()
+                        supabase.table("beetle_images").delete().eq("beetle_code", active_code).execute()
+                        
                         st.session_state.current_action = None
                         st.session_state.edit_target_code = None
                         st.success("刪除成功！")
@@ -1630,60 +1403,42 @@ elif menu == "新增個體與成長紀錄":
             st.error("「個體編號」、「ID」與「物種名稱」為必填欄位！")
         else:
             try:
-                with get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        """
-                        INSERT INTO beetles (
-                            beetle_code, custom_id, species, gender, origin, acquisition_source, initial_stage, 
-                            current_stage, hatch_date, parents_info, generation, lineage, 
-                            father_id, mother_id, notes, custom_maintenance_days
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                        (
-                            beetle_code,
-                            custom_id,
-                            species,
-                            gender,
-                            origin,
-                            acquisition_source,
-                            initial_stage,
-                            initial_stage,
-                            hatch_date.strftime("%Y-%m-%d"),
-                            parents_info,
-                            generation,
-                            lineage,
-                            father_id,
-                            mother_id,
-                            notes,
-                            m_days,
-                        ),
-                    )
+                beetle_payload = {
+                    "beetle_code": beetle_code,
+                    "custom_id": custom_id,
+                    "species": species,
+                    "gender": gender,
+                    "origin": origin,
+                    "acquisition_source": acquisition_source,
+                    "initial_stage": initial_stage,
+                    "current_stage": initial_stage,
+                    "hatch_date": hatch_date.strftime("%Y-%m-%d"),
+                    "parents_info": parents_info,
+                    "generation": generation,
+                    "lineage": lineage,
+                    "father_id": father_id,
+                    "mother_id": mother_id,
+                    "notes": notes,
+                    "custom_maintenance_days": m_days,
+                }
+                supabase.table("beetles").insert(beetle_payload).execute()
 
-                    if llength > 0 or lweight > 0 or lnotes or lmaintenance:
-                        cursor.execute(
-                            """
-                            INSERT INTO logs (beetle_code, entry_date, length_mm, weight_g, notes, maintenance_type)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                            (
-                                beetle_code,
-                                ldate.strftime("%Y-%m-%d"),
-                                llength if llength > 0 else None,
-                                lweight if lweight > 0 else None,
-                                lnotes,
-                                "維護" if lmaintenance else "一般紀錄",
-                            ),
-                        )
-                    conn.commit()
+                if llength > 0 or lweight > 0 or lnotes or lmaintenance:
+                    log_payload = {
+                        "beetle_code": beetle_code,
+                        "entry_date": ldate.strftime("%Y-%m-%d"),
+                        "length_mm": llength if llength > 0 else None,
+                        "weight_g": lweight if lweight > 0 else None,
+                        "notes": lnotes,
+                        "maintenance_type": "維護" if lmaintenance else "一般紀錄",
+                    }
+                    supabase.table("logs").insert(log_payload).execute()
 
                 st.success(f"成功建立個體與歷史紀錄：{beetle_code}")
                 st.session_state.clear_create_form = True
                 st.rerun()
-            except sqlite3.IntegrityError:
-                st.error(
-                    f"個體編號 `{beetle_code}` 已存在，請檢查並更換編號！"
-                )
+            except Exception as ex:
+                st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
 # 頁面 4: QR Code 掃描與識別
@@ -1723,17 +1478,12 @@ elif menu == "QR Code 掃描與識別":
                 st.markdown("#### QR Code 完整資料")
                 st.json(data)
 
-                with get_connection() as conn:
-                    df_beetles = pd.read_sql_query(
-                        "SELECT * FROM beetles WHERE beetle_code = ?",
-                        conn,
-                        params=(data.get("beetle_code"),),
-                    )
-
-                if not df_beetles.empty:
-                    info = df_beetles.iloc[0]
+                res = supabase.table("beetles").select("*").eq("beetle_code", data.get("beetle_code")).execute()
+                
+                if res.data:
+                    info = res.data[0]
                     st.markdown("#### 資料庫目前資料")
-                    st.json(dict(info))
+                    st.json(info)
                 else:
                     st.warning("資料庫中查無該個體編號之紀錄。")
             except Exception:
@@ -1746,16 +1496,14 @@ elif menu == "通知管理":
     st.title("通知管理")
     st.caption("設定待換土/維護通知的寄件服務與收件信箱。")
 
-    with get_connection() as conn:
-        settings_row = conn.execute(
-            "SELECT * FROM notification_settings WHERE id = 1"
-        ).fetchone()
-        recipient_rows = conn.execute(
-            "SELECT slot, email, enabled FROM notification_recipients ORDER BY slot"
-        ).fetchall()
+    res_set = supabase.table("notification_settings").select("*").eq("id", 1).execute()
+    settings_row = res_set.data[0] if res_set.data else {}
+
+    res_rec = supabase.table("notification_recipients").select("slot, email, enabled").order("slot").execute()
+    recipient_rows = res_rec.data if res_rec.data else []
 
     existing_recipient_count = max(
-        [row["slot"] for row in recipient_rows if row["email"]], default=1
+        [row["slot"] for row in recipient_rows if row.get("email")], default=1
     )
     if "notification_recipient_count" not in st.session_state:
         st.session_state.notification_recipient_count = min(
@@ -1767,57 +1515,57 @@ elif menu == "通知管理":
         st.subheader("通知設定")
         enabled = st.checkbox(
             "啟用通知設定",
-            value=bool(settings_row["enabled"]),
+            value=bool(settings_row.get("enabled", 0)),
         )
         notification_days = st.number_input(
             "通知週期 (天)",
             min_value=1,
             max_value=365,
-            value=int(settings_row["notification_days"]),
+            value=int(settings_row.get("notification_days", 1)),
             step=1,
         )
         subject = st.text_input(
             "通知主旨",
-            value=settings_row["subject"] or "甲蟲換土/維護提醒",
+            value=settings_row.get("subject") or "甲蟲換土/維護提醒",
         )
 
         st.subheader("SMTP 寄件設定")
-        smtp_host = st.text_input("SMTP 主機", value=settings_row["smtp_host"])
+        smtp_host = st.text_input("SMTP 主機", value=settings_row.get("smtp_host", ""))
         smtp_port = st.number_input(
             "SMTP Port",
             min_value=1,
             max_value=65535,
-            value=int(settings_row["smtp_port"]),
+            value=int(settings_row.get("smtp_port", 587)),
             step=1,
         )
         smtp_ssl = st.checkbox(
             "使用 SSL 連線",
-            value=bool(settings_row["smtp_ssl"]),
+            value=bool(settings_row.get("smtp_ssl", 0)),
         )
         smtp_username = st.text_input(
-            "SMTP 帳號", value=settings_row["smtp_username"]
+            "SMTP 帳號", value=settings_row.get("smtp_username", "")
         )
         smtp_password = st.text_input(
-            "SMTP 密碼", value=settings_row["smtp_password"], type="password"
+            "SMTP 密碼", value=settings_row.get("smtp_password", ""), type="password"
         )
         sender_email = st.text_input(
             "寄件人信箱",
-            value=settings_row["sender_email"] or settings_row["smtp_username"],
+            value=settings_row.get("sender_email") or settings_row.get("smtp_username", ""),
         )
 
         st.subheader("收件信箱 (最多 10 組)")
         recipient_values = []
         for row_index in range(recipient_count):
-            recipient = recipient_rows[row_index]
+            recipient = recipient_rows[row_index] if row_index < len(recipient_rows) else {"email": "", "enabled": 1}
             recipient_col1, recipient_col2 = st.columns([4, 1])
             recipient_email = recipient_col1.text_input(
                 f"信箱 {row_index + 1}",
-                value=recipient["email"] or "",
+                value=recipient.get("email") or "",
                 key=f"notification_email_{row_index + 1}",
             )
             recipient_enabled = recipient_col2.checkbox(
                 "啟用",
-                value=bool(recipient["enabled"]),
+                value=bool(recipient.get("enabled", 1)),
                 key=f"notification_enabled_{row_index + 1}",
             )
             recipient_values.append((row_index + 1, recipient_email, recipient_enabled))
@@ -1843,71 +1591,52 @@ elif menu == "通知管理":
             st.warning("至少保留 1 組收件信箱欄位。")
         else:
             removed_slot = recipient_count
-            with get_connection() as conn:
-                conn.execute(
-                    "UPDATE notification_recipients SET email='', enabled=0 WHERE slot=?",
-                    (removed_slot,),
-                )
-                conn.commit()
+            supabase.table("notification_recipients").update({"email": "", "enabled": 0}).eq("slot", removed_slot).execute()
             st.session_state.pop(f"notification_email_{removed_slot}", None)
             st.session_state.pop(f"notification_enabled_{removed_slot}", None)
             st.session_state.notification_recipient_count = recipient_count - 1
             st.rerun()
 
     if save_settings:
-        with get_connection() as conn:
-            conn.execute(
-                """
-                UPDATE notification_settings
-                SET enabled=?, notification_days=?, smtp_host=?, smtp_port=?,
-                    smtp_ssl=?, smtp_username=?, smtp_password=?, sender_email=?, subject=?
-                WHERE id=1
-                """,
-                (
-                    int(enabled),
-                    int(notification_days),
-                    smtp_host.strip(),
-                    int(smtp_port),
-                    int(smtp_ssl),
-                    smtp_username.strip(),
-                    smtp_password,
-                    sender_email.strip(),
-                    subject.strip() or "甲蟲換土/維護提醒",
-                ),
-            )
-            conn.executemany(
-                "UPDATE notification_recipients SET email=?, enabled=? WHERE slot=?",
-                [
-                    (email.strip(), int(slot_enabled), slot)
-                    for slot, email, slot_enabled in recipient_values
-                ]
-                + [
-                    ("", 0, slot)
-                    for slot in range(recipient_count + 1, 11)
-                ],
-            )
-            conn.commit()
+        settings_payload = {
+            "enabled": int(enabled),
+            "notification_days": int(notification_days),
+            "smtp_host": smtp_host.strip(),
+            "smtp_port": int(smtp_port),
+            "smtp_ssl": int(smtp_ssl),
+            "smtp_username": smtp_username.strip(),
+            "smtp_password": smtp_password,
+            "sender_email": sender_email.strip(),
+            "subject": subject.strip() or "甲蟲換土/維護提醒",
+        }
+        supabase.table("notification_settings").update(settings_payload).eq("id", 1).execute()
+
+        rec_upsert_payload = [
+            {"slot": slot, "email": email.strip(), "enabled": int(slot_enabled)}
+            for slot, email, slot_enabled in recipient_values
+        ] + [
+            {"slot": slot, "email": "", "enabled": 0}
+            for slot in range(recipient_count + 1, 11)
+        ]
+        supabase.table("notification_recipients").upsert(rec_upsert_payload).execute()
         st.success("通知設定已儲存。")
 
     st.markdown("---")
     st.subheader("立即寄送測試通知")
     st.caption("按下按鈕後會依目前儲存的設定寄送，不會自動在背景執行。")
     if st.button("立即寄送通知"):
-        with get_connection() as conn:
-            current_settings = conn.execute(
-                "SELECT * FROM notification_settings WHERE id = 1"
-            ).fetchone()
-            current_recipients = conn.execute(
-                "SELECT email FROM notification_recipients WHERE enabled=1 AND TRIM(email) != ''"
-            ).fetchall()
+        res_set = supabase.table("notification_settings").select("*").eq("id", 1).execute()
+        current_settings = res_set.data[0] if res_set.data else {}
 
-        recipients = [row["email"] for row in current_recipients]
+        res_rec = supabase.table("notification_recipients").select("email").eq("enabled", 1).neq("email", "").execute()
+        recipients = [row["email"] for row in res_rec.data if row.get("email", "").strip()]
+
         pending_records = get_pending_maintenance_records()
-        if not current_settings["enabled"]:
+        if not current_settings.get("enabled"):
             st.warning("通知功能尚未啟用，請先儲存並啟用通知設定。")
         elif not recipients:
             st.warning("尚未設定任何啟用中的收件信箱。")
-        elif not current_settings["smtp_host"]:
+        elif not current_settings.get("smtp_host"):
             st.warning("尚未設定 SMTP 主機。")
         elif not pending_records:
             st.info("目前沒有達到換土/維護條件的個體，不寄送通知。")
@@ -1916,12 +1645,9 @@ elif menu == "通知管理":
                 send_notification_email(
                     current_settings, recipients, pending_records
                 )
-                with get_connection() as conn:
-                    conn.execute(
-                        "UPDATE notification_settings SET last_sent_at=? WHERE id=1",
-                        (datetime.now().isoformat(timespec="seconds"),),
-                    )
-                    conn.commit()
+                supabase.table("notification_settings").update({
+                    "last_sent_at": datetime.now().isoformat(timespec="seconds")
+                }).eq("id", 1).execute()
                 st.success(f"通知已寄送至 {len(recipients)} 組信箱。")
             except Exception as ex:
                 st.error(f"寄送失敗：{ex}")
