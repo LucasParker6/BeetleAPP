@@ -13,5 +13,5 @@ jobs:
     steps:
       - name: Wake up Streamlit app
         run: |
-          curl -sL https://beetleapp-6jcvuxa8q7gjmwtv4zi9ni.streamlit.app/ > /dev/null
-          echo "Pinged Streamlit app successfully!"
+          wget --spider --quiet https://beetleapp-6jcvuxa8q7gjmwtv4zi9ni.streamlit.app/
+          echo "Woke up Streamlit app successfully!"
