@@ -2,8 +2,8 @@ name: Keep Streamlit App Alive
 
 on:
   schedule:
-    # 每 6 小時執行一次（格林威治時間 0, 6, 12, 18 點）
-    - cron: '0 */6 * * *'
+    # 改為每 1 小時執行一次（整點觸發）
+    - cron: '0 * * * *'
   # 允許手動點擊測試
   workflow_dispatch:
 
