@@ -12,9 +12,10 @@ import altair as alt
 from supabase import create_client, Client
 import cv2
 import numpy as np
+import graphviz
 
 # ==========================================
-# 1. Supabase 連線初始化[cite: 1]
+# 1. Supabase 連線初始化
 # ==========================================
 @st.cache_resource
 def init_supabase() -> Client:
@@ -30,14 +31,14 @@ BACKUP_TABLES = [
     "notification_settings",
     "notification_recipients",
     "beetle_images",
-    "announcements",  # 新增佈告欄資料表[cite: 1]
+    "announcements",
 ]
 BACKUP_REQUIRED_TABLES = [
     table_name for table_name in BACKUP_TABLES if table_name != "beetle_images"
 ]
 
 # ==========================================
-# 2. Supabase 資料庫操作與備份機制[cite: 1]
+# 2. Supabase 資料庫操作與備份機制
 # ==========================================
 def create_backup_payload():
     """建立包含所有系統資料的 JSON 備份內容。"""
@@ -234,7 +235,7 @@ def init_db():
 
 
 # ==========================================
-# 3. QR Code 生成工具 (易讀繁體中文 JSON 格式)[cite: 1]
+# 3. QR Code 生成工具 (易讀繁體中文 JSON 格式)
 # ==========================================
 def generate_qrcode(beetle_data: dict) -> Image.Image:
     """生成包含易讀格式個體資料與歷史紀錄的 QR Code 圖檔"""
@@ -251,7 +252,186 @@ def generate_qrcode(beetle_data: dict) -> Image.Image:
 
 
 # ==========================================
-# 4. Streamlit 主程式介面[cite: 1]
+# 輔助函式：格式化父/母 ID 顯示
+# ==========================================
+def format_parent_display(father_id, mother_id):
+    """
+    格式化父/母 ID 顯示：
+    - 若兩者皆有 ID，顯示格式如：父本ID / 母本ID
+    - 若其中一方無 ID，給予相對應的文字替代
+    - 若皆無，則顯示「無」
+    """
+    has_father_id = bool(father_id and str(father_id).strip())
+    has_mother_id = bool(mother_id and str(mother_id).strip())
+    
+    if has_father_id and has_mother_id:
+        return f"{father_id} / {mother_id}"
+    elif has_father_id:
+        return f"{father_id} / (無母本ID)"
+    elif has_mother_id:
+        return f"(無父本ID) / {mother_id}"
+    else:
+        return "無"
+
+
+# ==========================================
+# 4. 血統樹/族譜圖繪製核心邏輯 (Pedigree Tree Graph)
+# ==========================================
+def generate_pedigree_dot(target_code: str, depth: int = 3, show_offspring: bool = False) -> str:
+    """從 Supabase 取得資料並動態生成 Graphviz DOT 語言字串"""
+    res_b = supabase.table("beetles").select("*").execute()
+    res_l = supabase.table("logs").select("*").execute()
+    
+    beetles = res_b.data if res_b.data else []
+    logs = res_l.data if res_l.data else []
+    
+    beetle_map = {}
+    id_to_code_map = {}
+    for b in beetles:
+        code = b.get("beetle_code")
+        c_id = b.get("custom_id")
+        if code:
+            beetle_map[code] = b
+            if c_id:
+                id_to_code_map[str(c_id).strip()] = code
+
+    length_map = {}
+    if logs:
+        df_logs = pd.DataFrame(logs)
+        if "beetle_code" in df_logs.columns and "length_mm" in df_logs.columns:
+            df_valid_len = df_logs.dropna(subset=["length_mm"]).sort_values("entry_date", ascending=False)
+            for _, row in df_valid_len.iterrows():
+                b_c = row["beetle_code"]
+                if b_c not in length_map:
+                    length_map[b_c] = row["length_mm"]
+
+    def find_beetle_code(identifier):
+        if not identifier:
+            return None
+        s_id = str(identifier).strip()
+        if s_id in beetle_map:
+            return s_id
+        if s_id in id_to_code_map:
+            return id_to_code_map[s_id]
+        return None
+
+    visited_nodes = set()
+    nodes_dot = []
+    edges_dot = []
+
+    def get_node_style(b_info, is_target=False, is_unknown=False):
+        if is_target:
+            return 'shape=box, style="filled,rounded", fillcolor="#fef08a", color="#ca8a04", penwidth=2'
+        if is_unknown:
+            return 'shape=box, style="filled,dashed", fillcolor="#f3f4f6", color="#6b7280"'
+        
+        gender = b_info.get("gender", "未確定")
+        if gender == "公":
+            return 'shape=box, style="filled,rounded", fillcolor="#dbeafe", color="#1d4ed8"'
+        elif gender == "母":
+            return 'shape=box, style="filled,rounded", fillcolor="#fce7f3", color="#be185d", penwidth=2'
+        else:
+            return 'shape=box, style="filled,dashed", fillcolor="#f3f4f6", color="#6b7280"'
+
+    def build_node_label(identifier, b_info=None, is_unknown=False):
+        if is_unknown or not b_info:
+            return f"未知 / 未登錄\\n({identifier})"
+        cid = b_info.get("custom_id") or identifier
+        species = b_info.get("species", "未知")
+        lineage = b_info.get("lineage")
+        code = b_info.get("beetle_code")
+        len_val = length_map.get(code)
+        
+        f_id = b_info.get("father_id", "")
+        m_id = b_info.get("mother_id", "")
+        parent_str = format_parent_display(f_id, m_id)
+        
+        label_parts = [f"[ID] {cid}"]
+        if species and species != "-":
+            label_parts.append(f"物種: {species}")
+        if lineage and lineage != "-":
+            label_parts.append(f"血統: {lineage}")
+        if parent_str != "無":
+            label_parts.append(f"父/母: {parent_str}")
+        if len_val:
+            label_parts.append(f"體長: {len_val}mm")
+        return "\\n".join(label_parts)
+
+    def trace_ancestors(curr_code, curr_depth):
+        resolved_code = find_beetle_code(curr_code)
+        actual_code = resolved_code if resolved_code else curr_code
+        
+        if not actual_code or actual_code in visited_nodes:
+            return
+        visited_nodes.add(actual_code)
+
+        b_info = beetle_map.get(actual_code)
+        is_target = (actual_code == target_code)
+        style = get_node_style(b_info, is_target=is_target, is_unknown=(b_info is None))
+        label = build_node_label(actual_code, b_info, is_unknown=(b_info is None))
+        
+        safe_node_id = f"node_{hash(actual_code) & 0xffffffff}"
+        nodes_dot.append(f'  {safe_node_id} [label="{label}", {style}];')
+
+        if curr_depth >= depth or not b_info:
+            return
+
+        f_id = b_info.get("father_id")
+        if f_id and str(f_id).strip():
+            f_code = find_beetle_code(f_id) or str(f_id).strip()
+            safe_f_id = f"node_{hash(f_code) & 0xffffffff}"
+            edges_dot.append(f'  {safe_f_id} -> {safe_node_id} [label="父"];')
+            trace_ancestors(f_code, curr_depth + 1)
+
+        m_id = b_info.get("mother_id")
+        if m_id and str(m_id).strip():
+            m_code = find_beetle_code(m_id) or str(m_id).strip()
+            safe_m_id = f"node_{hash(m_code) & 0xffffffff}"
+            edges_dot.append(f'  {safe_m_id} -> {safe_node_id} [label="母"];')
+            trace_ancestors(m_code, curr_depth + 1)
+
+    trace_ancestors(target_code, 1)
+
+    if show_offspring:
+        target_info = beetle_map.get(target_code)
+        target_cid = target_info.get("custom_id") if target_info else None
+        
+        for b_code, b_item in beetle_map.items():
+            f_id = str(b_item.get("father_id", "")).strip()
+            m_id = str(b_item.get("mother_id", "")).strip()
+            
+            is_child = False
+            edge_label = "子"
+            if f_id and (f_id == target_code or (target_cid and f_id == str(target_cid))):
+                is_child = True
+                edge_label = "父子"
+            elif m_id and (m_id == target_code or (target_cid and m_id == str(target_cid))):
+                is_child = True
+                edge_label = "母子"
+
+            if is_child and b_code not in visited_nodes:
+                visited_nodes.add(b_code)
+                style = get_node_style(b_item)
+                label = build_node_label(b_code, b_item)
+                
+                safe_target_id = f"node_{hash(target_code) & 0xffffffff}"
+                safe_child_id = f"node_{hash(b_code) & 0xffffffff}"
+                
+                nodes_dot.append(f'  {safe_child_id} [label="{label}", {style}];')
+                edges_dot.append(f'  {safe_target_id} -> {safe_child_id} [label="{edge_label}"];')
+
+    dot_code = "digraph PedigreeTree {\n"
+    dot_code += "  rankdir=LR;\n"
+    dot_code += '  node [fontname="Microsoft JhengHei"];\n'
+    dot_code += "  " + "\n  ".join(nodes_dot) + "\n"
+    dot_code += "  " + "\n  ".join(edges_dot) + "\n"
+    dot_code += "}\n"
+    
+    return dot_code
+
+
+# ==========================================
+# 5. Streamlit 主程式介面
 # ==========================================
 st.set_page_config(
     page_title="甲蟲專業飼育紀錄系統",
@@ -260,7 +440,6 @@ st.set_page_config(
 
 init_db()
 
-# 初始化 Session State[cite: 1]
 if "edit_target_code" not in st.session_state:
     st.session_state.edit_target_code = None
 if "current_action" not in st.session_state:
@@ -335,6 +514,7 @@ menu = menu_center.segmented_control(
     [
         "全場總覽與待換土提醒",
         "個體清單與檔案管理",
+        "血統與族譜分析",
         "新增個體與成長紀錄",
         "QR Code 掃描與識別",
         "通知管理",
@@ -346,7 +526,7 @@ menu = menu_center.segmented_control(
 )
 
 # ==========================================
-# 頁面 1: 全場總覽與待換土提醒[cite: 1]
+# 頁面 1: 全場總覽與待換土提醒
 # ==========================================
 if menu == "全場總覽與待換土提醒":
     st.title("全場總覽與待換土提醒")
@@ -390,15 +570,11 @@ if menu == "全場總覽與待換土提醒":
 
     st.markdown("---")
 
-    # ------------------------------------------
-    # 新增功能：佈告欄
-    # ------------------------------------------
     ann_header_col1, ann_header_col2 = st.columns([8, 2])
     ann_header_col1.subheader("系統佈告欄")
     if ann_header_col2.button("➕ 新增公告", use_container_width=True, type="primary"):
         st.session_state.announcement_action = "add"
 
-    # 讀取佈告欄資料
     res_ann = supabase.table("announcements").select("*").order("created_at", desc=True).execute()
     announcements = res_ann.data if res_ann.data else []
 
@@ -419,7 +595,6 @@ if menu == "全場總覽與待換土提醒":
                     st.session_state.target_announcement = ann
                     st.rerun()
 
-    # 佈告欄彈窗機制
     @st.dialog("佈告欄管理")
     def render_announcement_dialog():
         action = st.session_state.get("announcement_action")
@@ -478,9 +653,6 @@ if menu == "全場總覽與待換土提醒":
     if st.session_state.get("announcement_action"):
         render_announcement_dialog()
 
-    # ------------------------------------------
-    # 原有區塊：待換土/維護提醒
-    # ------------------------------------------
     st.markdown("---")
     st.subheader("待換土/維護提醒")
 
@@ -568,7 +740,7 @@ if menu == "全場總覽與待換土提醒":
         st.success("全場狀況良好，目前沒有到達換土週期的個體！")
 
 # ==========================================
-# 頁面 2: 個體清單與檔案管理[cite: 1]
+# 頁面 2: 個體清單與檔案管理
 # ==========================================
 elif menu == "個體清單與檔案管理":
     st.title("個體清單與檔案管理")
@@ -714,7 +886,7 @@ elif menu == "個體清單與檔案管理":
 
             action_key = f"beetle_{page_start + row_number}_{row_code}"
             with row_cols[8].popover("操作選項"):
-                action_cols = st.columns(6)
+                action_cols = st.columns(7)
                 if action_cols[0].button("查看", key=f"view_{action_key}", use_container_width=True):
                     st.session_state.current_action = "view"
                     st.session_state.edit_target_code = row_code
@@ -730,13 +902,16 @@ elif menu == "個體清單與檔案管理":
                 if action_cols[2].button("曲線", key=f"chart_{action_key}", use_container_width=True):
                     st.session_state.current_action = "chart"
                     st.session_state.edit_target_code = row_code
-                if action_cols[3].button("QR", key=f"qr_{action_key}"):
+                if action_cols[3].button("血統", key=f"pedigree_{action_key}", use_container_width=True):
+                    st.session_state.current_action = "pedigree"
+                    st.session_state.edit_target_code = row_code
+                if action_cols[4].button("QR", key=f"qr_{action_key}"):
                     st.session_state.current_action = "qr"
                     st.session_state.edit_target_code = row_code
-                if action_cols[4].button("刪除", key=f"delete_{action_key}", use_container_width=True):
+                if action_cols[5].button("刪除", key=f"delete_{action_key}", use_container_width=True):
                     st.session_state.current_action = "delete"
                     st.session_state.edit_target_code = row_code
-                if action_cols[5].button("圖片", key=f"images_{action_key}", use_container_width=True):
+                if action_cols[6].button("圖片", key=f"images_{action_key}", use_container_width=True):
                     st.session_state.current_action = "images"
                     st.session_state.edit_target_code = row_code
 
@@ -779,9 +954,11 @@ elif menu == "個體清單與檔案管理":
                     v_col3.write(
                         f"**血統:** {selected_info.get('lineage') or '無'}"
                     )
-                    v_col3.write(
-                        f"**父/母 ID:** {selected_info.get('father_id') or '無'} / {selected_info.get('mother_id') or '無'}"
-                    )
+                    
+                    f_id_val = selected_info.get('father_id', '')
+                    m_id_val = selected_info.get('mother_id', '')
+                    formatted_parents = format_parent_display(f_id_val, m_id_val)
+                    v_col3.write(f"**父/母 ID:** {formatted_parents}")
 
                     st.write(
                         f"**個體換土提醒週期:** {selected_info.get('custom_maintenance_days') or 60} 天"
@@ -1178,6 +1355,11 @@ elif menu == "個體清單與檔案管理":
                                 )
                                 st.altair_chart((line_l + points_l).properties(height=300), use_container_width=True)
 
+                elif st.session_state.get("current_action") == "pedigree":
+                    st.subheader(f"{active_code} 血統樹/族譜圖")
+                    dot_str = generate_pedigree_dot(active_code, depth=3, show_offspring=False)
+                    st.graphviz_chart(dot_str)
+
                 elif st.session_state.get("current_action") == "qr":
                     st.subheader(f"{active_code} 專屬 QR Code")
                     
@@ -1308,7 +1490,74 @@ elif menu == "個體清單與檔案管理":
             render_action_dialog()
 
 # ==========================================
-# 頁面 3: 新增個體與成長紀錄[cite: 1]
+# 頁面 3: 血統與族譜分析 (獨立分頁)
+# ==========================================
+elif menu == "血統與族譜分析":
+    st.title("血統與族譜分析")
+    st.caption("自動繪製個體的直系血統樹，釐清血統來源並輔助履歷展示。")
+
+    res_b = supabase.table("beetles").select("beetle_code, custom_id, species").execute()
+    beetle_options = res_b.data if res_b.data else []
+
+    if not beetle_options:
+        st.info("目前資料庫無個體資料，請先新增個體。")
+    else:
+        # 新增 ID 搜尋框與物種搜尋框
+        filter_c1, filter_c2 = st.columns(2)
+        filter_id_input = filter_c1.text_input("過濾 ID 搜尋", placeholder="輸入 ID 關鍵字...", key="pedigree_filter_id")
+        filter_species_input = filter_c2.text_input("過濾物種搜尋", placeholder="輸入物種關鍵字...", key="pedigree_filter_species")
+
+        # 根據搜尋條件過濾選項
+        filtered_beetles = []
+        for b in beetle_options:
+            code = b.get("beetle_code", "")
+            cid = str(b.get("custom_id", ""))
+            sp = str(b.get("species", ""))
+
+            match_id = not filter_id_input.strip() or (filter_id_input.strip().lower() in cid.lower() or filter_id_input.strip().lower() in code.lower())
+            match_species = not filter_species_input.strip() or (filter_species_input.strip().lower() in sp.lower())
+
+            if match_id and match_species:
+                filtered_beetles.append(b)
+
+        if not filtered_beetles:
+            st.warning("找不到符合篩選條件的個體。")
+        else:
+            options_map = {}
+            for b in filtered_beetles:
+                code = b.get("beetle_code")
+                cid = b.get("custom_id") or code
+                sp = b.get("species", "")
+                display_str = f"{cid} ({code}) - {sp}"
+                options_map[display_str] = code
+
+            ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([4, 2, 2])
+            selected_display = ctrl_col1.selectbox("選擇目標個體", list(options_map.keys()))
+            selected_code = options_map[selected_display]
+
+            depth = ctrl_col2.selectbox("向上追溯代數", [2, 3, 4], index=1, help="2代: 祖父母 | 3代: 曾祖父母 | 4代: 高祖父母")
+            show_offspring = ctrl_col3.checkbox("顯示向下第一代子代", value=False)
+
+            st.markdown("---")
+
+            dot_code = generate_pedigree_dot(selected_code, depth=depth, show_offspring=show_offspring)
+
+            chart_col, code_col = st.tabs(["血統圖表渲染", "📜 DOT 原始碼與匯出"])
+
+            with chart_col:
+                st.graphviz_chart(dot_code)
+
+            with code_col:
+                st.code(dot_code, language="dot")
+                st.download_button(
+                    label="📥 下載 DOT 檔案",
+                    data=dot_code,
+                    file_name=f"pedigree_{selected_code}.dot",
+                    mime="text/vnd.graphviz"
+                )
+
+# ==========================================
+# 頁面 4: 新增個體與成長紀錄
 # ==========================================
 elif menu == "新增個體與成長紀錄":
     st.title("新增個體與成長紀錄")
@@ -1467,7 +1716,7 @@ elif menu == "新增個體與成長紀錄":
                 st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
-# 頁面 4: QR Code 掃描與識別 (使用 OpenCV 進行解碼)[cite: 1]
+# 頁面 5: QR Code 掃描與識別
 # ==========================================
 elif menu == "QR Code 掃描與識別":
     st.title("QR Code 掃描與個體識別")
@@ -1482,15 +1731,12 @@ elif menu == "QR Code 掃描與識別":
     decoded_json_str = None
 
     def process_qr_image(img_input):
-        """解析圖檔並使用 OpenCV 自動提取 QR Code 內容"""
         image = Image.open(img_input)
         st.image(image, caption="待掃描影像", width=300)
         
-        # 將 PIL Image 轉換為 OpenCV 格式 (BGR)
         img_np = np.array(image.convert("RGB"))
         img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        # 使用 OpenCV 進行 QR Code 辨識
         detector = cv2.QRCodeDetector()
         qr_content, bbox, _ = detector.detectAndDecode(img_cv)
 
@@ -1501,21 +1747,18 @@ elif menu == "QR Code 掃描與識別":
             st.error("❌ 照片中未偵測到有效的 QR Code，請確認照片對焦清晰並重試。")
             return None
 
-    # Tab 1: 相機拍照
     with scan_tab1:
         st.markdown("#### 拍照辨識")
         camera_img = st.camera_input("請將鏡頭對準標籤 QR Code 並按下拍照", key="qr_camera_input")
         if camera_img is not None:
             decoded_json_str = process_qr_image(camera_img)
 
-    # Tab 2: 圖片上傳
     with scan_tab2:
         st.markdown("#### 檔案上傳")
         img_file = st.file_uploader("請上傳 QR Code 標籤圖片", type=["png", "jpg", "jpeg", "webp"], key="qr_file_uploader")
         if img_file is not None:
             decoded_json_str = process_qr_image(img_file)
 
-    # Tab 3: 文字貼上
     with scan_tab3:
         st.markdown("#### 手動貼上內容")
         manual_text = st.text_area(
@@ -1527,7 +1770,6 @@ elif menu == "QR Code 掃描與識別":
         if st.button("解析輸入內容", type="primary"):
             decoded_json_str = manual_text
 
-    # 解碼與資料庫同步展示
     if decoded_json_str:
         st.markdown("---")
         try:
@@ -1566,7 +1808,7 @@ elif menu == "QR Code 掃描與識別":
             st.error(f"❌ 解析失敗：內容格式不正確或資料損壞。({e})")
 
 # ==========================================
-# 頁面 5: 通知管理[cite: 1]
+# 頁面 6: 通知管理
 # ==========================================
 elif menu == "通知管理":
     st.title("通知管理")
@@ -1729,7 +1971,7 @@ elif menu == "通知管理":
                 st.error(f"寄送失敗：{ex}")
 
 # ==========================================
-# 頁面 6: 備份/匯入[cite: 1]
+# 頁面 7: 備份/匯入
 # ==========================================
 elif menu == "備份/匯入":
     st.title("備份/匯入")
