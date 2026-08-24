@@ -30,6 +30,7 @@ BACKUP_TABLES = [
     "notification_settings",
     "notification_recipients",
     "beetle_images",
+    "announcements",  # 新增佈告欄資料表[cite: 1]
 ]
 BACKUP_REQUIRED_TABLES = [
     table_name for table_name in BACKUP_TABLES if table_name != "beetle_images"
@@ -69,13 +70,17 @@ def restore_backup_payload(payload):
         raise ValueError(f"備份缺少資料表：{', '.join(missing_tables)}")
 
     try:
-        for table_name in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles"]:
-            supabase.table(table_name).delete().neq("id" if table_name in ["logs", "beetle_images", "notification_settings"] else ("slot" if table_name == "notification_recipients" else "beetle_code"), "___dummy___").execute()
+        for table_name in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles", "announcements"]:
+            supabase.table(table_name).delete().neq(
+                "id" if table_name in ["logs", "beetle_images", "notification_settings", "announcements"] 
+                else ("slot" if table_name == "notification_recipients" else "beetle_code"), 
+                "___dummy___"
+            ).execute()
         
         for table_name in BACKUP_TABLES:
             records = payload["tables"].get(table_name, [])
             if records:
-                if table_name in ["logs", "beetle_images"]:
+                if table_name in ["logs", "beetle_images", "announcements"]:
                     for r in records:
                         r.pop("id", None)
                 supabase.table(table_name).insert(records).execute()
@@ -262,6 +267,10 @@ if "current_action" not in st.session_state:
     st.session_state.current_action = None
 if "edit_log_rows" not in st.session_state:
     st.session_state.edit_log_rows = 1
+if "announcement_action" not in st.session_state:
+    st.session_state.announcement_action = None
+if "target_announcement" not in st.session_state:
+    st.session_state.target_announcement = None
 
 st.markdown(
     """
@@ -316,6 +325,8 @@ st.sidebar.title("系統功能選單")
 def clear_action_on_menu_change():
     st.session_state.current_action = None
     st.session_state.edit_target_code = None
+    st.session_state.announcement_action = None
+    st.session_state.target_announcement = None
 
 
 menu_left, menu_center, menu_right = st.sidebar.columns([0.05, 0.9, 0.05])
@@ -329,7 +340,7 @@ menu = menu_center.segmented_control(
         "通知管理",
         "備份/匯入",
     ],
-    default="QR Code 掃描與識別",
+    default="全場總覽與待換土提醒",
     key="main_menu",
     on_change=clear_action_on_menu_change,
 )
@@ -377,6 +388,99 @@ if menu == "全場總覽與待換土提醒":
     col3.metric("化蛹數量", f"{pupa_cnt} 隻")
     col4.metric("成蟲數量", f"{adult_cnt} 隻")
 
+    st.markdown("---")
+
+    # ------------------------------------------
+    # 新增功能：佈告欄
+    # ------------------------------------------
+    ann_header_col1, ann_header_col2 = st.columns([8, 2])
+    ann_header_col1.subheader("系統佈告欄")
+    if ann_header_col2.button("➕ 新增公告", use_container_width=True, type="primary"):
+        st.session_state.announcement_action = "add"
+
+    # 讀取佈告欄資料
+    res_ann = supabase.table("announcements").select("*").order("created_at", desc=True).execute()
+    announcements = res_ann.data if res_ann.data else []
+
+    if not announcements:
+        st.info("目前尚無任何公告。")
+    else:
+        for ann in announcements:
+            with st.expander(f"{ann.get('title', '無標題')} ({ann.get('created_at', '')[:10]})"):
+                st.write(ann.get("content", ""))
+                
+                btn_col1, btn_col2, _ = st.columns([1, 1, 8])
+                if btn_col1.button("編輯", key=f"edit_ann_{ann['id']}"):
+                    st.session_state.announcement_action = "edit"
+                    st.session_state.target_announcement = ann
+                    st.rerun()
+                if btn_col2.button("刪除", key=f"del_ann_{ann['id']}"):
+                    st.session_state.announcement_action = "delete"
+                    st.session_state.target_announcement = ann
+                    st.rerun()
+
+    # 佈告欄彈窗機制
+    @st.dialog("佈告欄管理")
+    def render_announcement_dialog():
+        action = st.session_state.get("announcement_action")
+        target = st.session_state.get("target_announcement")
+
+        if action == "add":
+            st.subheader("新增公告")
+            with st.form("add_announcement_form"):
+                new_title = st.text_input("公告標題 (必填)")
+                new_content = st.text_area("公告內容 (必填)")
+                if st.form_submit_button("發布公告", type="primary"):
+                    if not new_title.strip() or not new_content.strip():
+                        st.error("標題與內容皆為必填！")
+                    else:
+                        supabase.table("announcements").insert({
+                            "title": new_title.strip(),
+                            "content": new_content.strip(),
+                            "created_at": datetime.now().isoformat(timespec="seconds")
+                        }).execute()
+                        st.session_state.announcement_action = None
+                        st.success("公告已發布！")
+                        st.rerun()
+
+        elif action == "edit" and target:
+            st.subheader("編輯公告")
+            with st.form("edit_announcement_form"):
+                edit_title = st.text_input("公告標題", value=target.get("title", ""))
+                edit_content = st.text_area("公告內容", value=target.get("content", ""))
+                if st.form_submit_button("儲存修改", type="primary"):
+                    if not edit_title.strip() or not edit_content.strip():
+                        st.error("標題與內容皆為必填！")
+                    else:
+                        supabase.table("announcements").update({
+                            "title": edit_title.strip(),
+                            "content": edit_content.strip(),
+                        }).eq("id", target["id"]).execute()
+                        st.session_state.announcement_action = None
+                        st.session_state.target_announcement = None
+                        st.success("公告修改成功！")
+                        st.rerun()
+
+        elif action == "delete" and target:
+            st.error(f"確定要刪除公告「{target.get('title')}」嗎？")
+            if st.button("確認刪除", type="primary"):
+                supabase.table("announcements").delete().eq("id", target["id"]).execute()
+                st.session_state.announcement_action = None
+                st.session_state.target_announcement = None
+                st.success("公告已刪除！")
+                st.rerun()
+
+        if st.button("關閉"):
+            st.session_state.announcement_action = None
+            st.session_state.target_announcement = None
+            st.rerun()
+
+    if st.session_state.get("announcement_action"):
+        render_announcement_dialog()
+
+    # ------------------------------------------
+    # 原有區塊：待換土/維護提醒
+    # ------------------------------------------
     st.markdown("---")
     st.subheader("待換土/維護提醒")
 
