@@ -4,3 +4,5 @@ qrcode
 streamlit
 altair
 supabase
+numpy
+opencv-python-headless
