@@ -2,7 +2,7 @@ import io
 import json
 import base64
 import smtplib
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from email.message import EmailMessage
 import pandas as pd
 from PIL import Image
@@ -11,8 +11,15 @@ import streamlit as st
 import altair as alt
 from supabase import create_client, Client
 
+# 嘗試載入 pyzbar 進行圖檔與相機拍攝之 QR Code 自動解碼[cite: 1]
+try:
+    from pyzbar.pyzbar import decode as qr_decode
+    HAS_PYZBAR = True
+except ImportError:
+    HAS_PYZBAR = False
+
 # ==========================================
-# 1. Supabase 連線初始化
+# 1. Supabase 連線初始化[cite: 1]
 # ==========================================
 @st.cache_resource
 def init_supabase() -> Client:
@@ -34,7 +41,7 @@ BACKUP_REQUIRED_TABLES = [
 ]
 
 # ==========================================
-# 2. Supabase 資料庫操作與備份機制
+# 2. Supabase 資料庫操作與備份機制[cite: 1]
 # ==========================================
 def create_backup_payload():
     """建立包含所有系統資料的 JSON 備份內容。"""
@@ -227,7 +234,7 @@ def init_db():
 
 
 # ==========================================
-# 3. QR Code 生成工具 (易讀繁體中文 JSON 格式)
+# 3. QR Code 生成工具 (易讀繁體中文 JSON 格式)[cite: 1]
 # ==========================================
 def generate_qrcode(beetle_data: dict) -> Image.Image:
     """生成包含易讀格式個體資料與歷史紀錄的 QR Code 圖檔"""
@@ -244,7 +251,7 @@ def generate_qrcode(beetle_data: dict) -> Image.Image:
 
 
 # ==========================================
-# 4. Streamlit 主程式介面
+# 4. Streamlit 主程式介面[cite: 1]
 # ==========================================
 st.set_page_config(
     page_title="甲蟲專業飼育紀錄系統",
@@ -253,7 +260,7 @@ st.set_page_config(
 
 init_db()
 
-# 初始化 Session State
+# 初始化 Session State[cite: 1]
 if "edit_target_code" not in st.session_state:
     st.session_state.edit_target_code = None
 if "current_action" not in st.session_state:
@@ -333,7 +340,7 @@ menu = menu_center.segmented_control(
 )
 
 # ==========================================
-# 頁面 1: 全場總覽與待換土提醒
+# 頁面 1: 全場總覽與待換土提醒[cite: 1]
 # ==========================================
 if menu == "全場總覽與待換土提醒":
     st.title("全場總覽與待換土提醒")
@@ -462,7 +469,7 @@ if menu == "全場總覽與待換土提醒":
         st.success("全場狀況良好，目前沒有到達換土週期的個體！")
 
 # ==========================================
-# 頁面 2: 個體清單與檔案管理
+# 頁面 2: 個體清單與檔案管理[cite: 1]
 # ==========================================
 elif menu == "個體清單與檔案管理":
     st.title("個體清單與檔案管理")
@@ -1212,7 +1219,7 @@ elif menu == "個體清單與檔案管理":
 
 
 # ==========================================
-# 頁面 3: 新增個體與成長紀錄
+# 頁面 3: 新增個體與成長紀錄[cite: 1]
 # ==========================================
 elif menu == "新增個體與成長紀錄":
     st.title("新增個體與成長紀錄")
@@ -1371,69 +1378,107 @@ elif menu == "新增個體與成長紀錄":
                 st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
-# 頁面 4: QR Code 掃描與識別 (優化顯示介面)
+# 頁面 4: QR Code 掃描與識別 (新增相機拍照與自動辨識解碼)[cite: 1]
 # ==========================================
 elif menu == "QR Code 掃描與識別":
     st.title("QR Code 掃描與個體識別")
-    st.caption("使用手機鏡頭拍照、上傳瓶身 QR Code 照片，或輸入內容解碼個體檔案。")
+    st.caption("使用手機/電腦鏡頭拍照、上傳瓶身照片，或輸入內容解碼個體檔案。")
 
-    scan_tab1, scan_tab2 = st.tabs(["圖片上傳 / 照相掃描", "貼上 QR Code 文字數據"])
+    scan_tab1, scan_tab2, scan_tab3 = st.tabs([
+        "📷 相機即時拍照", 
+        "📁 圖片上傳掃描", 
+        "📝 貼上 QR Code 文字數據"
+    ])
 
+    decoded_json_str = None
+
+    def process_qr_image(img_input):
+        """解析圖檔並自動提取 QR Code 內容"""
+        image = Image.open(img_input)
+        st.image(image, caption="待掃描影像", width=300)
+        
+        if not HAS_PYZBAR:
+            st.warning("⚠️ 系統尚未安裝 `pyzbar` 套件，無法自動解析影像內容。請手動使用「貼上 QR Code 文字數據」分頁。")
+            return None
+
+        decoded_objects = qr_decode(image)
+        if decoded_objects:
+            qr_content = decoded_objects[0].data.decode("utf-8")
+            st.success("🎉 自動辨識解碼成功！")
+            return qr_content
+        else:
+            st.error("❌ 照片中未偵測到有效的 QR Code，請確認照片對焦清晰並重試。")
+            return None
+
+    # Tab 1: 相機拍照
     with scan_tab1:
-        img_file = st.file_uploader("請上傳 QR Code 標籤圖片", type=["png", "jpg", "jpeg"])
-        if img_file is not None:
-            image = Image.open(img_file)
-            st.image(image, caption="已上傳圖片", width=250)
-            st.info("提示：請於右側 Tab 貼上解碼後的文字內容進行查詢。")
+        st.markdown("#### 拍照辨識")
+        camera_img = st.camera_input("請將鏡頭對準標籤 QR Code 並按下拍照", key="qr_camera_input")
+        if camera_img is not None:
+            decoded_json_str = process_qr_image(camera_img)
 
+    # Tab 2: 圖片上傳
     with scan_tab2:
-        qr_text_input = st.text_area(
-            "請貼上掃描條碼後讀取到的內容：",
-            placeholder='{\n  "個體編號": "DHH-202607-003",\n  "物種名稱": "長戟大兜蟲DHH",\n  "性別": "母",\n  "當前階段": "二齡幼蟲",\n  "成長紀錄": [\n    {\n      "日期": "2026-08-14",\n      "體重(g)": 7.9,\n      "類型": "維護",\n      "備註": "兜大完熟土"\n    }\n  ]\n}',
-            height=200
+        st.markdown("#### 檔案上傳")
+        img_file = st.file_uploader("請上傳 QR Code 標籤圖片", type=["png", "jpg", "jpeg", "webp"], key="qr_file_uploader")
+        if img_file is not None:
+            decoded_json_str = process_qr_image(img_file)
+
+    # Tab 3: 文字貼上
+    with scan_tab3:
+        st.markdown("#### 手動貼上內容")
+        manual_text = st.text_area(
+            "請貼上條碼讀取到的 JSON 數據：",
+            placeholder='{\n  "個體編號": "DHH-202607-003",\n  "物種名稱": "長戟大兜蟲DHH"\n}',
+            height=180,
+            key="qr_manual_input"
         )
-        if st.button("解析並查詢個體檔案", type="primary"):
-            try:
-                data = json.loads(qr_text_input)
-                
-                # 兼容新版繁體中文與舊版英文 Key
-                b_code = data.get("個體編號") or data.get("beetle_code")
-                species = data.get("物種名稱") or data.get("species")
-                gender = data.get("性別") or data.get("gender")
-                stage = data.get("當前階段") or data.get("current_stage")
-                logs = data.get("成長紀錄") or data.get("logs") or []
+        if st.button("解析輸入內容", type="primary"):
+            decoded_json_str = manual_text
 
-                st.success(f"✅ 解碼成功！個體編號：**{b_code}**")
-                
-                # 個體摘要視覺化展示
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("個體編號", b_code or "-")
-                c2.metric("物種名稱", species or "-")
-                c3.metric("性別", gender or "-")
-                c4.metric("當前階段", stage or "-")
-
-                st.markdown("#### 📜 履歷與成長紀錄")
-                if logs:
-                    df_qr_logs = pd.DataFrame(logs)
-                    st.dataframe(df_qr_logs, use_container_width=True)
-                else:
-                    st.caption("無歷史紀錄數據。")
-
-                st.markdown("---")
-                # 嘗試同步查詢 Supabase 資料庫中的最新即時數據
-                if b_code:
-                    res = supabase.table("beetles").select("*").eq("beetle_code", b_code).execute()
-                    if res.data:
-                        st.markdown("#### 🔄 資料庫最新即時狀態")
-                        st.json(res.data[0])
-                    else:
-                        st.warning("⚠️ 資料庫中查無此個體編號的最新紀錄（可能已被刪除或為離線標籤）。")
+    # 解碼與資料庫同步展示
+    if decoded_json_str:
+        st.markdown("---")
+        try:
+            data = json.loads(decoded_json_str)
             
-            except Exception as e:
-                st.error(f"❌ 解析失敗：輸入內容非合法的 JSON 格式或資料損壞。({e})")
+            # 兼容繁體中文與英文 Key
+            b_code = data.get("個體編號") or data.get("beetle_code")
+            species = data.get("物種名稱") or data.get("species")
+            gender = data.get("性別") or data.get("gender")
+            stage = data.get("當前階段") or data.get("current_stage")
+            logs = data.get("成長紀錄") or data.get("logs") or []
+
+            st.subheader(f"📌 個體檔案資訊：{b_code or '未命名'}")
+            
+            # 個體摘要 Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("個體編號", b_code or "-")
+            c2.metric("物種名稱", species or "-")
+            c3.metric("性別", gender or "-")
+            c4.metric("當前階段", stage or "-")
+
+            st.markdown("##### 📜 標籤履歷紀錄")
+            if logs:
+                st.dataframe(pd.DataFrame(logs), use_container_width=True)
+            else:
+                st.caption("此標籤未包含歷史紀錄數據。")
+
+            # 嘗試同步查詢 Supabase 資料庫中的最新即時數據
+            if b_code:
+                st.markdown("---")
+                res = supabase.table("beetles").select("*").eq("beetle_code", b_code).execute()
+                if res.data:
+                    st.markdown("#### 🔄 資料庫最新即時狀態")
+                    st.json(res.data[0])
+                else:
+                    st.warning("⚠️ 資料庫中查無此個體編號的最新紀錄（可能已被刪除或為離線標籤）。")
+        
+        except Exception as e:
+            st.error(f"❌ 解析失敗：內容格式不正確或資料損壞。({e})")
 
 # ==========================================
-# 頁面 5: 通知管理
+# 頁面 5: 通知管理[cite: 1]
 # ==========================================
 elif menu == "通知管理":
     st.title("通知管理")
@@ -1596,7 +1641,7 @@ elif menu == "通知管理":
                 st.error(f"寄送失敗：{ex}")
 
 # ==========================================
-# 頁面 6: 備份/匯入
+# 頁面 6: 備份/匯入[cite: 1]
 # ==========================================
 elif menu == "備份/匯入":
     st.title("備份/匯入")
