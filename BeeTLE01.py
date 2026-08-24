@@ -10,11 +10,8 @@ import qrcode
 import streamlit as st
 import altair as alt
 from supabase import create_client, Client
-
-# ==========================================
-# 模擬套件未安裝狀態 (強制設定 HAS_PYZBAR = False)[cite: 1]
-# ==========================================
-HAS_PYZBAR = False
+import cv2
+import numpy as np
 
 # ==========================================
 # 1. Supabase 連線初始化[cite: 1]
@@ -1366,7 +1363,7 @@ elif menu == "新增個體與成長紀錄":
                 st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
-# 頁面 4: QR Code 掃描與識別 (顯示未安裝 pyzbar 警告)[cite: 1]
+# 頁面 4: QR Code 掃描與識別 (使用 OpenCV 進行解碼)[cite: 1]
 # ==========================================
 elif menu == "QR Code 掃描與識別":
     st.title("QR Code 掃描與個體識別")
@@ -1381,18 +1378,19 @@ elif menu == "QR Code 掃描與識別":
     decoded_json_str = None
 
     def process_qr_image(img_input):
-        """解析圖檔並自動提取 QR Code 內容"""
+        """解析圖檔並使用 OpenCV 自動提取 QR Code 內容"""
         image = Image.open(img_input)
         st.image(image, caption="待掃描影像", width=300)
         
-        # 判斷 pyzbar 是否安裝[cite: 1]
-        if not HAS_PYZBAR:
-            st.warning("⚠️ 系統尚未安裝 `pyzbar` 套件，無法自動解碼圖檔。請改用「貼上 QR Code 文字數據」分頁。")
-            return None
+        # 將 PIL Image 轉換為 OpenCV 格式 (BGR)
+        img_np = np.array(image.convert("RGB"))
+        img_cv = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        decoded_objects = qr_decode(image)
-        if decoded_objects:
-            qr_content = decoded_objects[0].data.decode("utf-8")
+        # 使用 OpenCV 進行 QR Code 辨識
+        detector = cv2.QRCodeDetector()
+        qr_content, bbox, _ = detector.detectAndDecode(img_cv)
+
+        if qr_content:
             st.success("🎉 自動辨識解碼成功！")
             return qr_content
         else:
