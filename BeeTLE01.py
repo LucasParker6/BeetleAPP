@@ -11,12 +11,10 @@ import streamlit as st
 import altair as alt
 from supabase import create_client, Client
 
-# 嘗試載入 pyzbar 進行圖檔與相機拍攝之 QR Code 自動解碼[cite: 1]
-try:
-    from pyzbar.pyzbar import decode as qr_decode
-    HAS_PYZBAR = True
-except ImportError:
-    HAS_PYZBAR = False
+# ==========================================
+# 模擬套件未安裝狀態 (強制設定 HAS_PYZBAR = False)[cite: 1]
+# ==========================================
+HAS_PYZBAR = False
 
 # ==========================================
 # 1. Supabase 連線初始化[cite: 1]
@@ -334,7 +332,7 @@ menu = menu_center.segmented_control(
         "通知管理",
         "備份/匯入",
     ],
-    default="全場總覽與待換土提醒",
+    default="QR Code 掃描與識別",
     key="main_menu",
     on_change=clear_action_on_menu_change,
 )
@@ -649,7 +647,6 @@ elif menu == "個體清單與檔案管理":
             if not matching_beetles.empty:
                 selected_info = matching_beetles.iloc[0]
 
-                # 1. 查看詳情
                 if st.session_state.get("current_action") == "view":
                     st.info(f"個體詳細檔案：{active_code}")
                     v_col1, v_col2, v_col3 = st.columns(3)
@@ -711,7 +708,6 @@ elif menu == "個體清單與檔案管理":
                         )
                         st.dataframe(display_df, use_container_width=True)
 
-                # 2. 編輯資料
                 elif st.session_state.get("current_action") == "edit":
                     st.subheader(f"編輯個體資料：{active_code}")
 
@@ -1004,7 +1000,6 @@ elif menu == "個體清單與檔案管理":
                                 except Exception as ex:
                                     st.error(f"資料庫更新發生錯誤：{ex}")
 
-                # 3. 成長曲線
                 elif st.session_state.get("current_action") == "chart":
                     st.subheader(f"{active_code} 成長曲線圖表")
                     b_logs = pd.DataFrame()
@@ -1082,15 +1077,12 @@ elif menu == "個體清單與檔案管理":
                                 )
                                 st.altair_chart((line_l + points_l).properties(height=300), use_container_width=True)
 
-                # 4. QR Code (使用繁體中文 Key 與去除 null 格式)
                 elif st.session_state.get("current_action") == "qr":
                     st.subheader(f"{active_code} 專屬 QR Code")
                     
-                    # 查詢該個體的成長歷史紀錄
                     res_logs = supabase.table("logs").select("entry_date, length_mm, weight_g, maintenance_type, notes").eq("beetle_code", active_code).order("entry_date").execute()
                     logs_data = res_logs.data if res_logs.data else []
 
-                    # 格式化履歷，去除 None / null 欄位
                     formatted_logs = []
                     for log in logs_data:
                         log_item = {"日期": log.get("entry_date")}
@@ -1103,7 +1095,6 @@ elif menu == "個體清單與檔案管理":
                             log_item["備註"] = log.get("notes")
                         formatted_logs.append(log_item)
 
-                    # 封裝易讀的繁體中文 JSON 結構
                     qr_payload = {
                         "個體編號": selected_info.get("beetle_code"),
                         "物種名稱": selected_info.get("species"),
@@ -1126,7 +1117,6 @@ elif menu == "個體清單與檔案管理":
                         "**使用說明：**\n可將此 QR Code 列印並貼在飼育瓶/箱身。用手機相機掃描或於此系統「QR Code 掃描與識別」頁面即可讀取個體資料。"
                     )
 
-                # 5. 個體圖片管理
                 elif st.session_state.get("current_action") == "images":
                     st.subheader(f"{active_code} 圖片管理")
                     image_upload_version_key = f"image_upload_version_{active_code}"
@@ -1194,7 +1184,6 @@ elif menu == "個體清單與檔案管理":
                                 supabase.table("beetle_images").delete().eq("id", image_row["id"]).execute()
                                 st.rerun()
 
-                # 6. 刪除個體
                 elif st.session_state.get("current_action") == "delete":
                     st.error(
                         f"確定要刪除個體 {active_code} 及其所有履歷資料嗎？"
@@ -1216,7 +1205,6 @@ elif menu == "個體清單與檔案管理":
 
         if st.session_state.get("current_action") and st.session_state.get("edit_target_code"):
             render_action_dialog()
-
 
 # ==========================================
 # 頁面 3: 新增個體與成長紀錄[cite: 1]
@@ -1378,7 +1366,7 @@ elif menu == "新增個體與成長紀錄":
                 st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
-# 頁面 4: QR Code 掃描與識別 (新增相機拍照與自動辨識解碼)[cite: 1]
+# 頁面 4: QR Code 掃描與識別 (顯示未安裝 pyzbar 警告)[cite: 1]
 # ==========================================
 elif menu == "QR Code 掃描與識別":
     st.title("QR Code 掃描與個體識別")
@@ -1397,8 +1385,9 @@ elif menu == "QR Code 掃描與識別":
         image = Image.open(img_input)
         st.image(image, caption="待掃描影像", width=300)
         
+        # 判斷 pyzbar 是否安裝[cite: 1]
         if not HAS_PYZBAR:
-            st.warning("⚠️ 系統尚未安裝 `pyzbar` 套件，無法自動解析影像內容。請手動使用「貼上 QR Code 文字數據」分頁。")
+            st.warning("⚠️ 系統尚未安裝 `pyzbar` 套件，無法自動解碼圖檔。請改用「貼上 QR Code 文字數據」分頁。")
             return None
 
         decoded_objects = qr_decode(image)
@@ -1442,7 +1431,6 @@ elif menu == "QR Code 掃描與識別":
         try:
             data = json.loads(decoded_json_str)
             
-            # 兼容繁體中文與英文 Key
             b_code = data.get("個體編號") or data.get("beetle_code")
             species = data.get("物種名稱") or data.get("species")
             gender = data.get("性別") or data.get("gender")
@@ -1451,7 +1439,6 @@ elif menu == "QR Code 掃描與識別":
 
             st.subheader(f"📌 個體檔案資訊：{b_code or '未命名'}")
             
-            # 個體摘要 Metrics
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("個體編號", b_code or "-")
             c2.metric("物種名稱", species or "-")
@@ -1464,7 +1451,6 @@ elif menu == "QR Code 掃描與識別":
             else:
                 st.caption("此標籤未包含歷史紀錄數據。")
 
-            # 嘗試同步查詢 Supabase 資料庫中的最新即時數據
             if b_code:
                 st.markdown("---")
                 res = supabase.table("beetles").select("*").eq("beetle_code", b_code).execute()
