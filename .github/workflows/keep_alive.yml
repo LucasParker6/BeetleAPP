@@ -1,0 +1,17 @@
+name: Keep Streamlit App Alive
+
+on:
+  schedule:
+    # 改為每 1 小時執行一次（整點觸發）
+    - cron: '0 * * * *'
+  # 允許手動點擊測試
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake up Streamlit app
+        run: |
+          wget --spider --quiet https://beetleapp-6jcvuxa8q7gjmwtv4zi9ni.streamlit.app/
+          echo "Woke up Streamlit app successfully!"
