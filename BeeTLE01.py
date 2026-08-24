@@ -14,15 +14,12 @@ from supabase import create_client, Client
 # ==========================================
 # 1. Supabase 連線初始化
 # ==========================================
-# 使用 cache_resource 避免每次頁面重新整理時都重複建立連線
 @st.cache_resource
 def init_supabase() -> Client:
-    # 讀取 secrets 中的設定 (.streamlit/secrets.toml)
     url = st.secrets["supabase"]["SUPABASE_URL"]
     key = st.secrets["supabase"]["SUPABASE_KEY"]
     return create_client(url, key)
 
-# 初始化 supabase 物件（全域可用）
 supabase = init_supabase()
 
 BACKUP_TABLES = [
@@ -70,14 +67,12 @@ def restore_backup_payload(payload):
         raise ValueError(f"備份缺少資料表：{', '.join(missing_tables)}")
 
     try:
-        # 清空所有表（注意外鍵順序）
         for table_name in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles"]:
             supabase.table(table_name).delete().neq("id" if table_name in ["logs", "beetle_images", "notification_settings"] else ("slot" if table_name == "notification_recipients" else "beetle_code"), "___dummy___").execute()
         
         for table_name in BACKUP_TABLES:
             records = payload["tables"].get(table_name, [])
             if records:
-                # 若為自增主鍵的 Log 或 Image，移除 id 讓 PostgreSQL 自動算號
                 if table_name in ["logs", "beetle_images"]:
                     for r in records:
                         r.pop("id", None)
@@ -208,8 +203,7 @@ def send_notification_email(settings, recipients, pending_list):
 
 
 def init_db():
-    """初始化 Supabase 基礎設定 (如 notification_settings 預設列)"""
-    # 確保 notification_settings 有 ID=1 預設列
+    """初始化 Supabase 基礎設定"""
     res = supabase.table("notification_settings").select("*").eq("id", 1).execute()
     if not res.data:
         supabase.table("notification_settings").insert({
@@ -225,7 +219,6 @@ def init_db():
             "subject": "甲蟲換土/維護提醒"
         }).execute()
     
-    # 確保 notification_recipients 有 1~10 Slot
     res_rec = supabase.table("notification_recipients").select("slot").execute()
     existing_slots = [r["slot"] for r in res_rec.data] if res_rec.data else []
     missing_slots = [{"slot": s, "email": "", "enabled": 1} for s in range(1, 11) if s not in existing_slots]
@@ -233,68 +226,12 @@ def init_db():
         supabase.table("notification_recipients").insert(missing_slots).execute()
 
 
-def seed_sample_data():
-    """載入測試範例資料"""
-    res = supabase.table("beetles").select("beetle_code", count="exact").execute()
-    if res.count == 0 or len(res.data) == 0:
-        today = date.today()
-        sample_beetles = [
-            {
-                "beetle_code": "2026-DHH-01",
-                "custom_id": "DHH-M01",
-                "species": "赫克力士長角大カブト",
-                "gender": "公",
-                "origin": "瓜地馬拉",
-                "acquisition_source": "自繁",
-                "initial_stage": "一齡幼蟲",
-                "current_stage": "三齡幼蟲",
-                "hatch_date": "2025-08-15",
-                "parents_info": "170mm極太系",
-                "generation": "CBF1",
-                "lineage": "極太血統",
-                "father_id": "F-170",
-                "mother_id": "M-075",
-                "notes": "吃食量大，食痕正常",
-                "custom_maintenance_days": 60,
-            },
-            {
-                "beetle_code": "2026-彩虹-01",
-                "custom_id": "RB-01",
-                "species": "彩虹鍬形蟲",
-                "gender": "母",
-                "origin": "澳洲昆士蘭",
-                "acquisition_source": "購入",
-                "initial_stage": "卵",
-                "current_stage": "二齡幼蟲",
-                "hatch_date": "2025-11-01",
-                "parents_info": "綠彩自留",
-                "generation": "WF2",
-                "lineage": "綠彩系",
-                "father_id": "RB-F02",
-                "mother_id": "RB-M01",
-                "notes": "狀態安定",
-                "custom_maintenance_days": 45,
-            },
-        ]
-        supabase.table("beetles").insert(sample_beetles).execute()
-
-        d1 = (today - timedelta(days=90)).strftime("%Y-%m-%d")
-        d2 = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-
-        sample_logs = [
-            {"beetle_code": "2026-DHH-01", "entry_date": d1, "length_mm": 35.0, "weight_g": 45.2, "notes": "換土", "maintenance_type": "維護"},
-            {"beetle_code": "2026-DHH-01", "entry_date": d2, "length_mm": 65.0, "weight_g": 88.5, "notes": "轉木屑", "maintenance_type": "維護"},
-            {"beetle_code": "2026-彩虹-01", "entry_date": d1, "length_mm": 12.0, "weight_g": 5.5, "notes": "換菌", "maintenance_type": "維護"},
-        ]
-        supabase.table("logs").insert(sample_logs).execute()
-
-
 # ==========================================
-# 3. QR Code 生成工具
+# 3. QR Code 生成工具 (易讀繁體中文 JSON 格式)
 # ==========================================
 def generate_qrcode(beetle_data: dict) -> Image.Image:
-    """生成包含甲蟲資料的 QR Code 圖檔"""
-    qr_json = json.dumps(beetle_data, ensure_ascii=False, default=str)
+    """生成包含易讀格式個體資料與歷史紀錄的 QR Code 圖檔"""
+    qr_json = json.dumps(beetle_data, ensure_ascii=False, indent=2, default=str)
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -323,8 +260,6 @@ if "current_action" not in st.session_state:
     st.session_state.current_action = None
 if "edit_log_rows" not in st.session_state:
     st.session_state.edit_log_rows = 1
-if "confirm_clear_database" not in st.session_state:
-    st.session_state.confirm_clear_database = False
 
 st.markdown(
     """
@@ -396,29 +331,6 @@ menu = menu_center.segmented_control(
     key="main_menu",
     on_change=clear_action_on_menu_change,
 )
-
-st.sidebar.markdown("---")
-if st.sidebar.button("載入測試示範資料", use_container_width=True):
-    seed_sample_data()
-    st.sidebar.success("示範資料已載入！")
-    st.rerun()
-
-if st.sidebar.button("清空所有資料庫紀錄", use_container_width=True):
-    st.session_state.confirm_clear_database = True
-
-if st.session_state.confirm_clear_database:
-    st.sidebar.warning("此操作會刪除所有個體、成長紀錄與通知設定，確定要繼續嗎？")
-    confirm_col1, confirm_col2 = st.sidebar.columns(2)
-    if confirm_col1.button("確認清空", type="primary"):
-        for t in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles"]:
-            supabase.table(t).delete().neq("id" if t in ["logs", "beetle_images", "notification_settings"] else ("slot" if t == "notification_recipients" else "beetle_code"), "___dummy___").execute()
-        
-        st.session_state.confirm_clear_database = False
-        st.sidebar.success("資料庫已全數清空！")
-        st.rerun()
-    if confirm_col2.button("取消"):
-        st.session_state.confirm_clear_database = False
-        st.rerun()
 
 # ==========================================
 # 頁面 1: 全場總覽與待換土提醒
@@ -544,7 +456,7 @@ if menu == "全場總覽與待換土提醒":
         st.dataframe(pd.DataFrame(pending_list), use_container_width=True)
     elif total_active_beetles == 0:
         st.info(
-            "目前資料庫中沒有任何活體甲蟲檔案，請點擊左側「載入測試示範資料」或前往「新增個體」分頁建立。"
+            "目前資料庫中沒有任何活體甲蟲檔案，請前往「新增個體」分頁建立。"
         )
     else:
         st.success("全場狀況良好，目前沒有到達換土週期的個體！")
@@ -1055,7 +967,6 @@ elif menu == "個體清單與檔案管理":
                                     
                                     supabase.table("beetles").update(update_payload).eq("beetle_code", active_code).execute()
 
-                                    # 重寫 logs
                                     supabase.table("logs").delete().eq("beetle_code", active_code).execute()
                                     if edit_beetle_code != active_code:
                                         supabase.table("logs").delete().eq("beetle_code", edit_beetle_code).execute()
@@ -1164,13 +1075,34 @@ elif menu == "個體清單與檔案管理":
                                 )
                                 st.altair_chart((line_l + points_l).properties(height=300), use_container_width=True)
 
-                # 4. QR Code
+                # 4. QR Code (使用繁體中文 Key 與去除 null 格式)
                 elif st.session_state.get("current_action") == "qr":
                     st.subheader(f"{active_code} 專屬 QR Code")
+                    
+                    # 查詢該個體的成長歷史紀錄
+                    res_logs = supabase.table("logs").select("entry_date, length_mm, weight_g, maintenance_type, notes").eq("beetle_code", active_code).order("entry_date").execute()
+                    logs_data = res_logs.data if res_logs.data else []
+
+                    # 格式化履歷，去除 None / null 欄位
+                    formatted_logs = []
+                    for log in logs_data:
+                        log_item = {"日期": log.get("entry_date")}
+                        if log.get("length_mm") is not None:
+                            log_item["體長(mm)"] = log.get("length_mm")
+                        if log.get("weight_g") is not None:
+                            log_item["體重(g)"] = log.get("weight_g")
+                        log_item["類型"] = log.get("maintenance_type", "紀錄")
+                        if log.get("notes"):
+                            log_item["備註"] = log.get("notes")
+                        formatted_logs.append(log_item)
+
+                    # 封裝易讀的繁體中文 JSON 結構
                     qr_payload = {
-                        key: value
-                        for key, value in selected_info.to_dict().items()
-                        if pd.notna(value)
+                        "個體編號": selected_info.get("beetle_code"),
+                        "物種名稱": selected_info.get("species"),
+                        "性別": selected_info.get("gender"),
+                        "當前階段": selected_info.get("current_stage"),
+                        "成長紀錄": formatted_logs
                     }
                     qr_img = generate_qrcode(qr_payload)
 
@@ -1215,7 +1147,6 @@ elif menu == "個體清單與檔案管理":
                     ):
                         new_imgs = []
                         for img in uploaded_images:
-                            # 轉為 Base64 存入 PostgreSQL
                             b64 = base64.b64encode(img.getvalue()).decode("ascii")
                             new_imgs.append({
                                 "beetle_code": active_code,
@@ -1239,7 +1170,6 @@ elif menu == "個體清單與檔案管理":
                         st.markdown(f"目前共有 {len(image_rows)} 張圖片")
                         for image_row in image_rows:
                             image_col, delete_col = st.columns([4, 1])
-                            # 還原 Base64 圖片
                             try:
                                 img_bytes = base64.b64decode(image_row["image_data"])
                             except Exception:
@@ -1441,53 +1371,66 @@ elif menu == "新增個體與成長紀錄":
                 st.error(f"建立失敗，個體編號 `{beetle_code}` 可能已存在或發生錯誤：{ex}")
 
 # ==========================================
-# 頁面 4: QR Code 掃描與識別
+# 頁面 4: QR Code 掃描與識別 (優化顯示介面)
 # ==========================================
 elif menu == "QR Code 掃描與識別":
     st.title("QR Code 掃描與個體識別")
-    st.caption(
-        "使用手機鏡頭拍照、上傳瓶身 QR Code 照片，或輸入內容解碼個體檔案。"
-    )
+    st.caption("使用手機鏡頭拍照、上傳瓶身 QR Code 照片，或輸入內容解碼個體檔案。")
 
-    scan_tab1, scan_tab2 = st.tabs(
-        ["圖片上傳 / 照相掃描", "貼上 QR Code 文字數據"]
-    )
+    scan_tab1, scan_tab2 = st.tabs(["圖片上傳 / 照相掃描", "貼上 QR Code 文字數據"])
 
     with scan_tab1:
-        img_file = st.file_uploader(
-            "請上傳 QR Code 標籤圖片", type=["png", "jpg", "jpeg"]
-        )
+        img_file = st.file_uploader("請上傳 QR Code 標籤圖片", type=["png", "jpg", "jpeg"])
         if img_file is not None:
             image = Image.open(img_file)
             st.image(image, caption="已上傳圖片", width=250)
-            st.info(
-                "提示：上傳影像成功！點擊下方 Tab 貼上解碼文字即可查詢資料。"
-            )
+            st.info("提示：請於右側 Tab 貼上解碼後的文字內容進行查詢。")
 
     with scan_tab2:
         qr_text_input = st.text_area(
-            "請貼上掃描條碼後讀取到的內容 (JSON 格式)：",
-            placeholder='{"beetle_code": "2026-DHH-01", ...}',
+            "請貼上掃描條碼後讀取到的內容：",
+            placeholder='{\n  "個體編號": "DHH-202607-003",\n  "物種名稱": "長戟大兜蟲DHH",\n  "性別": "母",\n  "當前階段": "二齡幼蟲",\n  "成長紀錄": [\n    {\n      "日期": "2026-08-14",\n      "體重(g)": 7.9,\n      "類型": "維護",\n      "備註": "兜大完熟土"\n    }\n  ]\n}',
+            height=200
         )
-        if st.button("解碼與查詢個體檔案"):
+        if st.button("解析並查詢個體檔案", type="primary"):
             try:
                 data = json.loads(qr_text_input)
-                st.success(
-                    f"解碼成功！個體編號：{data.get('beetle_code')}"
-                )
-                st.markdown("#### QR Code 完整資料")
-                st.json(data)
-
-                res = supabase.table("beetles").select("*").eq("beetle_code", data.get("beetle_code")).execute()
                 
-                if res.data:
-                    info = res.data[0]
-                    st.markdown("#### 資料庫目前資料")
-                    st.json(info)
+                # 兼容新版繁體中文與舊版英文 Key
+                b_code = data.get("個體編號") or data.get("beetle_code")
+                species = data.get("物種名稱") or data.get("species")
+                gender = data.get("性別") or data.get("gender")
+                stage = data.get("當前階段") or data.get("current_stage")
+                logs = data.get("成長紀錄") or data.get("logs") or []
+
+                st.success(f"✅ 解碼成功！個體編號：**{b_code}**")
+                
+                # 個體摘要視覺化展示
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("個體編號", b_code or "-")
+                c2.metric("物種名稱", species or "-")
+                c3.metric("性別", gender or "-")
+                c4.metric("當前階段", stage or "-")
+
+                st.markdown("#### 📜 履歷與成長紀錄")
+                if logs:
+                    df_qr_logs = pd.DataFrame(logs)
+                    st.dataframe(df_qr_logs, use_container_width=True)
                 else:
-                    st.warning("資料庫中查無該個體編號之紀錄。")
-            except Exception:
-                st.error("QR Code 數據無效或非對應 JSON 格式。")
+                    st.caption("無歷史紀錄數據。")
+
+                st.markdown("---")
+                # 嘗試同步查詢 Supabase 資料庫中的最新即時數據
+                if b_code:
+                    res = supabase.table("beetles").select("*").eq("beetle_code", b_code).execute()
+                    if res.data:
+                        st.markdown("#### 🔄 資料庫最新即時狀態")
+                        st.json(res.data[0])
+                    else:
+                        st.warning("⚠️ 資料庫中查無此個體編號的最新紀錄（可能已被刪除或為離線標籤）。")
+            
+            except Exception as e:
+                st.error(f"❌ 解析失敗：輸入內容非合法的 JSON 格式或資料損壞。({e})")
 
 # ==========================================
 # 頁面 5: 通知管理
