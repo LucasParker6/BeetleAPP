@@ -6,3 +6,4 @@ altair
 supabase
 numpy
 opencv-python-headless
+graphviz
