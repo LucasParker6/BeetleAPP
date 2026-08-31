@@ -10,6 +10,7 @@ import qrcode
 import streamlit as st
 import altair as alt
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 import cv2
 import numpy as np
 import graphviz
@@ -32,6 +33,8 @@ BACKUP_TABLES = [
     "notification_recipients",
     "beetle_images",
     "announcements",
+    "breeding_rooms",
+    "larvae_batches",
 ]
 BACKUP_REQUIRED_TABLES = [
     table_name for table_name in BACKUP_TABLES if table_name != "beetle_images"
@@ -40,6 +43,23 @@ BACKUP_REQUIRED_TABLES = [
 # ==========================================
 # 2. Supabase 資料庫操作與備份機制
 # ==========================================
+def table_exists(table_name: str) -> bool:
+    """檢查 Supabase 中指定資料表是否存在，避免未建立表格造成頁面直接崩潰。"""
+    try:
+        supabase.table(table_name).select("id").limit(1).execute()
+        return True
+    except Exception as exc:
+        message = str(exc)
+        if (
+            "Could not find the table" in message
+            or "PGRST205" in message
+            or "does not exist" in message.lower()
+            or "relation" in message.lower() and "does not exist" in message.lower()
+        ):
+            return False
+        raise
+
+
 def create_backup_payload():
     """建立包含所有系統資料的 JSON 備份內容。"""
     payload = {
@@ -49,6 +69,9 @@ def create_backup_payload():
         "tables": {},
     }
     for table_name in BACKUP_TABLES:
+        if not table_exists(table_name):
+            payload["tables"][table_name] = []
+            continue
         res = supabase.table(table_name).select("*").execute()
         records = res.data if res.data else []
         payload["tables"][table_name] = records
@@ -71,17 +94,36 @@ def restore_backup_payload(payload):
         raise ValueError(f"備份缺少資料表：{', '.join(missing_tables)}")
 
     try:
-        for table_name in ["beetle_images", "logs", "notification_recipients", "notification_settings", "beetles", "announcements"]:
-            supabase.table(table_name).delete().neq(
-                "id" if table_name in ["logs", "beetle_images", "notification_settings", "announcements"] 
-                else ("slot" if table_name == "notification_recipients" else "beetle_code"), 
-                "___dummy___"
-            ).execute()
-        
+        for table_name in [
+            "beetle_images",
+            "logs",
+            "notification_recipients",
+            "notification_settings",
+            "beetles",
+            "announcements",
+            "breeding_rooms",
+            "larvae_batches",
+        ]:
+            if not table_exists(table_name):
+                continue
+            key_column = {
+                "logs": "id",
+                "beetle_images": "id",
+                "notification_settings": "id",
+                "announcements": "id",
+                "breeding_rooms": "room_code",
+                "larvae_batches": "batch_code",
+                "notification_recipients": "slot",
+                "beetles": "beetle_code",
+            }.get(table_name, "id")
+            supabase.table(table_name).delete().neq(key_column, "___dummy___").execute()
+
         for table_name in BACKUP_TABLES:
+            if not table_exists(table_name):
+                continue
             records = payload["tables"].get(table_name, [])
             if records:
-                if table_name in ["logs", "beetle_images", "announcements"]:
+                if table_name in ["logs", "beetle_images", "announcements", "breeding_rooms", "larvae_batches"]:
                     for r in records:
                         r.pop("id", None)
                 supabase.table(table_name).insert(records).execute()
@@ -90,85 +132,142 @@ def restore_backup_payload(payload):
 
 
 def get_pending_maintenance_records():
-    """取得目前需要換土或維護的個體清單。"""
+    """取得目前需要換土或維護的個體與幼蟲批次清單。"""
     today = date.today()
-    res_b = supabase.table("beetles").select("*").execute()
-    res_l = supabase.table("logs").select("*").execute()
-    
-    df_beetles = pd.DataFrame(res_b.data if res_b.data else [])
-    df_logs = pd.DataFrame(res_l.data if res_l.data else [])
+    res_b = supabase.table("beetles").select("*").execute() if table_exists("beetles") else None
+    res_l = supabase.table("logs").select("*").execute() if table_exists("logs") else None
+    res_larvae = supabase.table("larvae_batches").select("*").execute() if table_exists("larvae_batches") else None
 
-    if df_beetles.empty or "beetle_code" not in df_beetles.columns:
-        return []
-
-    df_valid = df_beetles[
-        df_beetles["beetle_code"].notna()
-        & (df_beetles["beetle_code"].astype(str).str.strip() != "")
-    ]
-    df_active = df_valid[df_valid["current_stage"] != "死亡"]
+    df_beetles = pd.DataFrame(res_b.data if res_b and res_b.data else [])
+    df_logs = pd.DataFrame(res_l.data if res_l and res_l.data else [])
+    df_larvae = pd.DataFrame(res_larvae.data if res_larvae and res_larvae.data else [])
     pending_list = []
 
-    for _, beetle in df_active.iterrows():
-        b_code = beetle.get("beetle_code")
-        stage = beetle.get("current_stage", "未設定")
-        if stage in ["蛹", "成蟲", "死亡"]:
-            continue
+    if not df_beetles.empty and "beetle_code" in df_beetles.columns:
+        df_valid = df_beetles[
+            df_beetles["beetle_code"].notna()
+            & (df_beetles["beetle_code"].astype(str).str.strip() != "")
+        ].copy()
 
-        target_days = beetle.get("custom_maintenance_days")
-        if pd.isna(target_days) or not target_days:
-            target_days = 60
-        target_days = int(target_days)
-
-        b_logs = pd.DataFrame()
-        if not df_logs.empty and "beetle_code" in df_logs.columns:
-            b_logs = df_logs[df_logs["beetle_code"] == b_code].sort_values(
-                "entry_date", ascending=False
+        # 總列管數量只計算活體，明確排除 current_stage =「死亡」。
+        # fillna + strip 可避免 NULL/空白資料造成篩選異常。
+        if "current_stage" in df_valid.columns:
+            stage_normalized = (
+                df_valid["current_stage"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
             )
+            df_active = df_valid[stage_normalized != "死亡"].copy()
+        else:
+            df_active = pd.DataFrame(columns=df_valid.columns)
 
-        maintenance_logs = b_logs
-        if not maintenance_logs.empty and "maintenance_type" in maintenance_logs.columns:
-            maintenance_logs = maintenance_logs[
-                maintenance_logs["maintenance_type"] == "維護"
-            ]
+        for _, beetle in df_active.iterrows():
+            b_code = beetle.get("beetle_code")
+            stage = beetle.get("current_stage", "未設定")
+            if stage in ["蛹", "成蟲", "死亡"]:
+                continue
 
-        if not maintenance_logs.empty:
-            last_date_str = maintenance_logs.iloc[0]["entry_date"]
+            target_days = beetle.get("custom_maintenance_days")
+            if pd.isna(target_days) or not target_days:
+                target_days = 60
+            target_days = int(target_days)
+
+            b_logs = pd.DataFrame()
+            if not df_logs.empty and "beetle_code" in df_logs.columns:
+                b_logs = df_logs[df_logs["beetle_code"] == b_code].sort_values(
+                    "entry_date", ascending=False
+                )
+
+            maintenance_logs = b_logs
+            if not maintenance_logs.empty and "maintenance_type" in maintenance_logs.columns:
+                maintenance_logs = maintenance_logs[
+                    maintenance_logs["maintenance_type"] == "維護"
+                ]
+
+            if not maintenance_logs.empty:
+                last_date_str = maintenance_logs.iloc[0]["entry_date"]
+                try:
+                    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                    days_passed = (today - last_date).days
+                except (TypeError, ValueError):
+                    last_date_str = "格式異常"
+                    days_passed = 999
+            else:
+                last_date_str = "尚未紀錄"
+                days_passed = 999
+
+            latest_log = b_logs.iloc[0] if not b_logs.empty else None
+            last_length = latest_log.get("length_mm") if latest_log is not None else None
+            last_weight = latest_log.get("weight_g") if latest_log is not None else None
+
+            if days_passed >= target_days:
+                pending_list.append(
+                    {
+                        "個體編號": b_code,
+                        "ID": beetle.get("custom_id", "-"),
+                        "物種": beetle.get("species", "-"),
+                        "當前階段": stage,
+                        "個體提醒週期": f"{target_days} 天",
+                        "上次換土日": last_date_str,
+                        "已相隔天數": (
+                            f"{days_passed} 天"
+                            if days_passed != 999
+                            else "未曾紀錄"
+                        ),
+                        "最新體長 (mm)": (
+                            last_length if pd.notnull(last_length) and last_length is not None else "-"
+                        ),
+                        "最新體重 (g)": (
+                            last_weight if pd.notnull(last_weight) and last_weight is not None else "-"
+                        ),
+                        "類型": "個體",
+                    }
+                )
+
+    if not df_larvae.empty and "batch_code" in df_larvae.columns:
+        for _, batch in df_larvae.iterrows():
+            batch_code = batch.get("batch_code")
+            if not batch_code:
+                continue
+
+            stage = batch.get("current_stage", "未設定")
+            if stage in ["蛹", "成蟲", "死亡"]:
+                continue
+
+            target_days = batch.get("maintenance_days")
+            if pd.isna(target_days) or not target_days:
+                target_days = 60
+            target_days = int(target_days)
+
+            harvest_date = batch.get("harvest_date")
             try:
-                last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                last_date = datetime.strptime(str(harvest_date), "%Y-%m-%d").date()
                 days_passed = (today - last_date).days
             except (TypeError, ValueError):
-                last_date_str = "格式異常"
+                last_date = None
                 days_passed = 999
-        else:
-            last_date_str = "尚未紀錄"
-            days_passed = 999
 
-        latest_log = b_logs.iloc[0] if not b_logs.empty else None
-        last_length = latest_log.get("length_mm") if latest_log is not None else None
-        last_weight = latest_log.get("weight_g") if latest_log is not None else None
+            if days_passed >= target_days:
+                pending_list.append(
+                    {
+                        "個體編號": batch_code,
+                        "ID": batch.get("batch_code", "-"),
+                        "物種": batch.get("species", "-"),
+                        "當前階段": stage,
+                        "個體提醒週期": f"{target_days} 天",
+                        "上次換土日": (harvest_date or "尚未紀錄"),
+                        "已相隔天數": (
+                            f"{days_passed} 天"
+                            if days_passed != 999
+                            else "未曾紀錄"
+                        ),
+                        "最新體長 (mm)": "-",
+                        "最新體重 (g)": "-",
+                        "類型": "幼蟲批次",
+                    }
+                )
 
-        if days_passed >= target_days:
-            pending_list.append(
-                {
-                    "個體編號": b_code,
-                    "ID": beetle.get("custom_id", "-"),
-                    "物種": beetle.get("species", "-"),
-                    "當前階段": stage,
-                    "個體提醒週期": f"{target_days} 天",
-                    "上次換土日": last_date_str,
-                    "已相隔天數": (
-                        f"{days_passed} 天"
-                        if days_passed != 999
-                        else "未曾紀錄"
-                    ),
-                    "最新體長 (mm)": (
-                        last_length if pd.notnull(last_length) and last_length is not None else "-"
-                    ),
-                    "最新體重 (g)": (
-                        last_weight if pd.notnull(last_weight) and last_weight is not None else "-"
-                    ),
-                }
-            )
     return pending_list
 
 
@@ -212,6 +311,9 @@ def send_notification_email(settings, recipients, pending_list):
 
 def init_db():
     """初始化 Supabase 基礎設定"""
+    if not table_exists("notification_settings"):
+        return
+
     res = supabase.table("notification_settings").select("*").eq("id", 1).execute()
     if not res.data:
         supabase.table("notification_settings").insert({
@@ -226,12 +328,13 @@ def init_db():
             "sender_email": "",
             "subject": "甲蟲換土/維護提醒"
         }).execute()
-    
-    res_rec = supabase.table("notification_recipients").select("slot").execute()
-    existing_slots = [r["slot"] for r in res_rec.data] if res_rec.data else []
-    missing_slots = [{"slot": s, "email": "", "enabled": 1} for s in range(1, 11) if s not in existing_slots]
-    if missing_slots:
-        supabase.table("notification_recipients").insert(missing_slots).execute()
+
+    if table_exists("notification_recipients"):
+        res_rec = supabase.table("notification_recipients").select("slot").execute()
+        existing_slots = [r["slot"] for r in res_rec.data] if res_rec.data else []
+        missing_slots = [{"slot": s, "email": "", "enabled": 1} for s in range(1, 11) if s not in existing_slots]
+        if missing_slots:
+            supabase.table("notification_recipients").insert(missing_slots).execute()
 
 
 # ==========================================
@@ -450,6 +553,14 @@ if "announcement_action" not in st.session_state:
     st.session_state.announcement_action = None
 if "target_announcement" not in st.session_state:
     st.session_state.target_announcement = None
+if "breeding_room_action" not in st.session_state:
+    st.session_state.breeding_room_action = None
+if "breeding_room_edit_id" not in st.session_state:
+    st.session_state.breeding_room_edit_id = None
+if "larvae_batch_action" not in st.session_state:
+    st.session_state.larvae_batch_action = None
+if "larvae_batch_edit_id" not in st.session_state:
+    st.session_state.larvae_batch_edit_id = None
 
 st.markdown(
     """
@@ -513,6 +624,8 @@ menu = menu_center.segmented_control(
     "",
     [
         "全場總覽與待換土提醒",
+        "產房管理",
+        "幼蟲管理",
         "個體清單與檔案管理",
         "血統與族譜分析",
         "新增個體與成長紀錄",
@@ -531,25 +644,72 @@ menu = menu_center.segmented_control(
 if menu == "全場總覽與待換土提醒":
     st.title("全場總覽與待換土提醒")
 
-    res_b = supabase.table("beetles").select("*").execute()
-    res_l = supabase.table("logs").select("*").execute()
-    
-    df_beetles = pd.DataFrame(res_b.data if res_b.data else [])
-    df_logs = pd.DataFrame(res_l.data if res_l.data else [])
+    # 直接讀取 beetles，避免用 table_exists("beetles") 的欄位檢查影響資料統計。
+    # beetles 的資料主鍵/識別欄位可能不是 id，因此這裡以實際存在的 beetle_code 判斷有效個體。
+    try:
+        res_b = supabase.table("beetles").select("*").execute()
+        beetle_records = res_b.data if res_b.data else []
+    except Exception as ex:
+        beetle_records = []
+        st.error(f"讀取 beetles 資料表失敗：{ex}")
 
-    if "beetle_code" in df_beetles.columns and not df_beetles.empty:
+    res_l = supabase.table("logs").select("*").execute() if table_exists("logs") else None
+    res_larvae = supabase.table("larvae_batches").select("*").execute() if table_exists("larvae_batches") else None
+
+    df_beetles = pd.DataFrame(beetle_records)
+    df_logs = pd.DataFrame(res_l.data if res_l and res_l.data else [])
+    df_larvae = pd.DataFrame(res_larvae.data if res_larvae and res_larvae.data else [])
+
+    # --------------------------------------------------
+    # 列管數量統計
+    # --------------------------------------------------
+    # 先取得 beetles 中有有效 beetle_code 的個體，再從中排除死亡個體。
+    if not df_beetles.empty and "beetle_code" in df_beetles.columns:
         df_valid = df_beetles[
             df_beetles["beetle_code"].notna()
-            & (df_beetles["beetle_code"].astype(str).str.strip() != "")
-        ]
-        df_active = df_valid[df_valid["current_stage"] != "死亡"]
+            & (
+                df_beetles["beetle_code"]
+                .astype(str)
+                .str.strip()
+                .ne("")
+            )
+        ].copy()
     else:
         df_valid = pd.DataFrame()
+
+    # current_stage 不存在時，一律視為「未設定」，仍然算列管資料。
+    if not df_valid.empty:
+        if "current_stage" not in df_valid.columns:
+            df_valid["current_stage"] = "未設定"
+        else:
+            df_valid["current_stage"] = (
+                df_valid["current_stage"]
+                .fillna("未設定")
+                .astype(str)
+                .str.strip()
+                .replace("", "未設定")
+            )
+
+    # 活體列管數量 = 有效個體中明確排除「死亡」狀態。
+    # 這裡只使用 df_active 作為全場總覽的列管數量來源，
+    # 避免把包含死亡紀錄的 df_valid 直接拿來計數。
+    if not df_valid.empty:
+        stage_normalized = (
+            df_valid["current_stage"]
+            .fillna("")
+            .astype(str)
+            .str.replace("\u3000", " ", regex=False)
+            .str.strip()
+        )
+        df_active = df_valid[
+            stage_normalized.ne("死亡")
+        ].copy()
+    else:
         df_active = pd.DataFrame()
 
     total_active_beetles = len(df_active)
 
-    if not df_active.empty and "current_stage" in df_active.columns:
+    if not df_active.empty:
         larvae_cnt = len(
             df_active[
                 df_active["current_stage"].isin(
@@ -562,11 +722,35 @@ if menu == "全場總覽與待換土提醒":
     else:
         larvae_cnt, pupa_cnt, adult_cnt = 0, 0, 0
 
-    col1, col2, col3, col4 = st.columns(4)
+    larvae_batch_total = len(df_larvae) if not df_larvae.empty else 0
+    pending_larvae_batches = 0
+    if not df_larvae.empty:
+        for _, batch in df_larvae.iterrows():
+            stage = batch.get("current_stage", "未設定")
+            if stage in ["蛹", "成蟲", "死亡"]:
+                continue
+            maintenance_days = batch.get("maintenance_days")
+            try:
+                maintenance_days = int(maintenance_days) if maintenance_days not in [None, "", pd.NA] else 60
+            except (TypeError, ValueError):
+                maintenance_days = 60
+            harvest_date = batch.get("harvest_date")
+            try:
+                days_passed = (date.today() - datetime.strptime(str(harvest_date), "%Y-%m-%d").date()).days
+            except (TypeError, ValueError):
+                days_passed = 999
+            if days_passed >= maintenance_days:
+                pending_larvae_batches += 1
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("總列管數量 (活體)", f"{total_active_beetles} 隻")
     col2.metric("幼蟲數量", f"{larvae_cnt} 隻")
     col3.metric("化蛹數量", f"{pupa_cnt} 隻")
     col4.metric("成蟲數量", f"{adult_cnt} 隻")
+    col5.metric("幼蟲批次數量", f"{larvae_batch_total} 批")
+
+    if pending_larvae_batches:
+        st.warning(f"目前有 **{pending_larvae_batches}** 個幼蟲批次達到換土/維護條件，請至「幼蟲管理」頁面檢視。")
 
     st.markdown("---")
 
@@ -732,15 +916,282 @@ if menu == "全場總覽與待換土提醒":
             f"目前共有 **{len(pending_list)}** 隻個體已達到換土/維護條件！"
         )
         st.dataframe(pd.DataFrame(pending_list), use_container_width=True)
-    elif total_active_beetles == 0:
+    elif total_registered_beetles == 0:
         st.info(
-            "目前資料庫中沒有任何活體甲蟲檔案，請前往「新增個體」分頁建立。"
+            "目前資料庫中沒有任何有效的列管甲蟲資料，請前往「新增個體與成長紀錄」建立。"
         )
+    elif total_active_beetles == 0:
+        st.info("目前列管資料皆為死亡個體，沒有需要換土/維護的活體。")
     else:
         st.success("全場狀況良好，目前沒有到達換土週期的個體！")
 
 # ==========================================
-# 頁面 2: 個體清單與檔案管理
+# 頁面 2: 產房管理
+# ==========================================
+elif menu == "產房管理":
+    st.title("產房管理")
+    st.caption("記錄種親交配、產房投產與結束日期，掌握每個產房的完整生命週期。")
+
+    if table_exists("breeding_rooms"):
+        res_rooms = supabase.table("breeding_rooms").select("*").order("start_date", desc=True).execute()
+        rooms = res_rooms.data if res_rooms.data else []
+    else:
+        rooms = []
+    df_rooms = pd.DataFrame(rooms)
+
+    if not table_exists("breeding_rooms"):
+        st.warning("目前 Supabase 尚未建立 breeding_rooms 資料表，請先在資料庫中執行建立 SQL 後再使用此功能。")
+    else:
+        with st.form("breeding_room_add_form"):
+            st.subheader("新增產房")
+            room_cols = st.columns(3)
+            room_code = room_cols[0].text_input("產房編號 (必填)", placeholder="例: ROOM-2026-01")
+            beetle_info = room_cols[1].text_input("種親 / 甲蟲對應", placeholder="例: DHH-M01 x DHH-F02")
+            status = room_cols[2].selectbox("狀態", ["開始", "結束"], index=0)
+
+            date_cols = st.columns(3)
+            start_date = date_cols[0].date_input("開始日期", value=date.today())
+            end_date = date_cols[1].date_input("結束日期（選填）", value=None)
+            notes = date_cols[2].text_area("備註", placeholder="請輸入產房備註...")
+
+            if st.form_submit_button("新增產房", type="primary"):
+                if not room_code.strip():
+                    st.error("產房編號為必填欄位。")
+                else:
+                    payload = {
+                        "room_code": room_code.strip(),
+                        "beetle_info": beetle_info.strip(),
+                        "start_date": start_date.strftime("%Y-%m-%d"),
+                        "end_date": end_date.strftime("%Y-%m-%d") if end_date is not None else None,
+                        "status": status,
+                        "notes": notes.strip(),
+                    }
+                    try:
+                        supabase.table("breeding_rooms").insert(payload).execute()
+                        st.success(f"產房 {room_code.strip()} 已新增。")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"新增產房失敗：{ex}")
+
+    st.markdown("---")
+    st.subheader("產房列表")
+
+    keyword = st.text_input("關鍵字搜尋", placeholder="輸入產房編號、種親說明或備註")
+    status_filter = st.selectbox("狀態篩選", ["全部", "開始", "結束"], index=0)
+
+    if not df_rooms.empty:
+        filtered_rooms = df_rooms.copy()
+        if status_filter != "全部":
+            filtered_rooms = filtered_rooms[filtered_rooms["status"].fillna("").astype(str) == status_filter]
+        if keyword.strip():
+            keyword_lower = keyword.strip().lower()
+            filtered_rooms = filtered_rooms[
+                filtered_rooms["room_code"].fillna("").astype(str).str.lower().str.contains(keyword_lower, na=False)
+                | filtered_rooms["beetle_info"].fillna("").astype(str).str.lower().str.contains(keyword_lower, na=False)
+                | filtered_rooms["notes"].fillna("").astype(str).str.lower().str.contains(keyword_lower, na=False)
+            ]
+
+        if filtered_rooms.empty:
+            st.info("查無符合條件的產房資料。")
+        else:
+            for _, room in filtered_rooms.iterrows():
+                with st.expander(f"{room.get('room_code', '未命名產房')}｜{room.get('status', '開始')}｜{room.get('start_date', '')}"):
+                    c1, c2, c3 = st.columns(3)
+                    c1.write(f"**產房編號：** {room.get('room_code', '-')}")
+                    c2.write(f"**種親/甲蟲對應：** {room.get('beetle_info', '-')}")
+                    c3.write(f"**狀態：** {room.get('status', '開始')}")
+                    c4, c5, c6 = st.columns(3)
+                    c4.write(f"**開始日期：** {room.get('start_date', '-')}")
+                    c5.write(f"**結束日期：** {room.get('end_date') or '尚未結束'}")
+                    c6.write(f"**備註：** {room.get('notes') or '無'}")
+
+                    edit_col, delete_col = st.columns(2)
+                    if edit_col.button("編輯", key=f"edit_room_{room.get('room_code')}_{room.get('id')}"):
+                        st.session_state.breeding_room_action = "edit"
+                        st.session_state.breeding_room_edit_id = room.get("id")
+                    if delete_col.button("刪除", key=f"delete_room_{room.get('room_code')}_{room.get('id')}"):
+                        supabase.table("breeding_rooms").delete().eq("id", room.get("id")).execute()
+                        st.success("產房資料已刪除。")
+                        st.rerun()
+
+                    if st.session_state.get("breeding_room_action") == "edit" and st.session_state.get("breeding_room_edit_id") == room.get("id"):
+                        with st.form(f"edit_room_form_{room.get('id')}"):
+                            edit_room_code = st.text_input("產房編號", value=room.get("room_code", ""))
+                            edit_beetle_info = st.text_input("種親 / 甲蟲對應", value=room.get("beetle_info", ""))
+                            edit_status = st.selectbox("狀態", ["開始", "結束"], index=["開始", "結束"].index(room.get("status", "開始")))
+                            edit_start = st.date_input("開始日期", value=datetime.strptime(str(room.get("start_date")), "%Y-%m-%d").date() if room.get("start_date") else date.today())
+                            edit_end_raw = room.get("end_date")
+                            edit_end = st.date_input("結束日期（選填）", value=datetime.strptime(str(edit_end_raw), "%Y-%m-%d").date() if edit_end_raw else None)
+                            edit_notes = st.text_area("備註", value=room.get("notes") or "")
+                            if st.form_submit_button("儲存修改", type="primary"):
+                                payload = {
+                                    "room_code": edit_room_code.strip(),
+                                    "beetle_info": edit_beetle_info.strip(),
+                                    "start_date": edit_start.strftime("%Y-%m-%d"),
+                                    "end_date": edit_end.strftime("%Y-%m-%d") if edit_end is not None else None,
+                                    "status": edit_status,
+                                    "notes": edit_notes.strip(),
+                                }
+                                supabase.table("breeding_rooms").update(payload).eq("id", room.get("id")).execute()
+                                st.session_state.breeding_room_action = None
+                                st.session_state.breeding_room_edit_id = None
+                                st.success("產房資料已更新。")
+                                st.rerun()
+
+    else:
+        st.info("目前尚無任何產房紀錄。")
+
+# ==========================================
+# 頁面 3: 幼蟲管理
+# ==========================================
+elif menu == "幼蟲管理":
+    st.title("幼蟲管理")
+    st.caption("集中管理批次幼蟲的種群資訊、數量與換土提醒週期。")
+
+    if table_exists("larvae_batches"):
+        res_larvae = supabase.table("larvae_batches").select("*").order("harvest_date", desc=True).execute()
+        larvae_batches = res_larvae.data if res_larvae.data else []
+    else:
+        larvae_batches = []
+    df_larvae = pd.DataFrame(larvae_batches)
+
+    if not table_exists("larvae_batches"):
+        st.warning("目前 Supabase 尚未建立 larvae_batches 資料表，請先在資料庫中執行建立 SQL 後再使用此功能。")
+    else:
+        with st.form("larvae_batch_add_form"):
+            st.subheader("新增幼蟲批次")
+            c1, c2, c3 = st.columns(3)
+            batch_code = c1.text_input("批次編號 (必填)", placeholder="例: LARV-2026-01")
+            species = c2.text_input("物種名稱 (必填)", placeholder="例: 赫克力士長角大カブト")
+            lineage = c3.text_input("血統", placeholder="例: 極太血統")
+
+            c4, c5, c6 = st.columns(3)
+            parents = c4.text_input("親代")
+            generation = c5.text_input("累代", placeholder="例: CBF1")
+            father_id = c6.text_input("父 ID")
+
+            c7, c8, c9 = st.columns(3)
+            mother_id = c7.text_input("母 ID")
+            initial_stage = c8.selectbox("初始階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"], index=0)
+            current_stage = c9.selectbox("當前階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"], index=0)
+
+            c10, c11, c12 = st.columns(3)
+            harvest_date = c10.date_input("孵化 / 採收日期", value=date.today())
+            quantity = c11.number_input("數量", min_value=1, value=1, step=1)
+            maintenance_days = c12.number_input("換土週期 (天)", min_value=1, value=60, step=5)
+
+            notes = st.text_area("備註", placeholder="請輸入批次備註...")
+
+            if st.form_submit_button("新增幼蟲批次", type="primary"):
+                if not batch_code.strip() or not species.strip():
+                    st.error("批次編號與物種名稱為必填欄位。")
+                else:
+                    payload = {
+                        "batch_code": batch_code.strip(),
+                        "species": species.strip(),
+                        "lineage": lineage.strip(),
+                        "parents": parents.strip(),
+                        "generation": generation.strip(),
+                        "father_id": father_id.strip(),
+                        "mother_id": mother_id.strip(),
+                        "initial_stage": initial_stage,
+                        "current_stage": current_stage,
+                        "harvest_date": harvest_date.strftime("%Y-%m-%d"),
+                        "quantity": int(quantity),
+                        "maintenance_days": int(maintenance_days),
+                        "notes": notes.strip(),
+                    }
+                    try:
+                        supabase.table("larvae_batches").insert(payload).execute()
+                        st.success(f"幼蟲批次 {batch_code.strip()} 已新增。")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"新增幼蟲批次失敗：{ex}")
+
+    st.markdown("---")
+    st.subheader("幼蟲批次列表")
+
+    if df_larvae.empty:
+        st.info("目前尚無任何幼蟲批次資料。")
+    else:
+        for _, batch in df_larvae.iterrows():
+            with st.expander(f"{batch.get('batch_code', '未命名批次')}｜{batch.get('species', '-') }｜{batch.get('current_stage', '一齡幼蟲')}"):
+                cols = st.columns(4)
+                cols[0].write(f"**批次編號：** {batch.get('batch_code', '-')}")
+                cols[1].write(f"**物種：** {batch.get('species', '-')}")
+                cols[2].write(f"**血統：** {batch.get('lineage') or '無'}")
+                cols[3].write(f"**累代：** {batch.get('generation') or '無'}")
+
+                c5, c6, c7, c8 = st.columns(4)
+                c5.write(f"**親代：** {batch.get('parents') or '無'}")
+                c6.write(f"**父/母 ID：** {batch.get('father_id') or '-'} / {batch.get('mother_id') or '-'}")
+                c7.write(f"**初始階段：** {batch.get('initial_stage', '-')}")
+                c8.write(f"**當前階段：** {batch.get('current_stage', '-')}")
+
+                c9, c10, c11, c12 = st.columns(4)
+                c9.write(f"**孵化/採收日期：** {batch.get('harvest_date') or '-'}")
+                c10.write(f"**數量：** {batch.get('quantity') or 0}")
+                c11.write(f"**換土週期：** {batch.get('maintenance_days') or 60} 天")
+                c12.write(f"**備註：** {batch.get('notes') or '無'}")
+
+                edit_col, delete_col = st.columns(2)
+                if edit_col.button("編輯", key=f"edit_larvae_{batch.get('batch_code')}_{batch.get('id')}"):
+                    st.session_state.larvae_batch_action = "edit"
+                    st.session_state.larvae_batch_edit_id = batch.get("id")
+                if delete_col.button("刪除", key=f"delete_larvae_{batch.get('batch_code')}_{batch.get('id')}"):
+                    supabase.table("larvae_batches").delete().eq("id", batch.get("id")).execute()
+                    st.success("幼蟲批次已刪除。")
+                    st.rerun()
+
+                if st.session_state.get("larvae_batch_action") == "edit" and st.session_state.get("larvae_batch_edit_id") == batch.get("id"):
+                    with st.form(f"edit_larvae_form_{batch.get('id')}"):
+                        edit_c1, edit_c2, edit_c3 = st.columns(3)
+                        edit_batch_code = edit_c1.text_input("批次編號", value=batch.get("batch_code", ""))
+                        edit_species = edit_c2.text_input("物種名稱", value=batch.get("species", ""))
+                        edit_lineage = edit_c3.text_input("血統", value=batch.get("lineage") or "")
+
+                        edit_c4, edit_c5, edit_c6 = st.columns(3)
+                        edit_parents = edit_c4.text_input("親代", value=batch.get("parents") or "")
+                        edit_generation = edit_c5.text_input("累代", value=batch.get("generation") or "")
+                        edit_father_id = edit_c6.text_input("父 ID", value=batch.get("father_id") or "")
+
+                        edit_c7, edit_c8, edit_c9 = st.columns(3)
+                        edit_mother_id = edit_c7.text_input("母 ID", value=batch.get("mother_id") or "")
+                        edit_initial_stage = edit_c8.selectbox("初始階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"], index=["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"].index(batch.get("initial_stage", "一齡幼蟲")))
+                        edit_current_stage = edit_c9.selectbox("當前階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"], index=["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"].index(batch.get("current_stage", "一齡幼蟲")))
+
+                        edit_c10, edit_c11, edit_c12 = st.columns(3)
+                        initial_harvest = batch.get("harvest_date")
+                        harvest_value = datetime.strptime(str(initial_harvest), "%Y-%m-%d").date() if initial_harvest else date.today()
+                        edit_harvest_date = edit_c10.date_input("孵化 / 採收日期", value=harvest_value)
+                        edit_quantity = edit_c11.number_input("數量", min_value=1, value=int(batch.get("quantity") or 1), step=1)
+                        edit_maintenance_days = edit_c12.number_input("換土週期 (天)", min_value=1, value=int(batch.get("maintenance_days") or 60), step=5)
+                        edit_notes = st.text_area("備註", value=batch.get("notes") or "")
+
+                        if st.form_submit_button("儲存修改", type="primary"):
+                            payload = {
+                                "batch_code": edit_batch_code.strip(),
+                                "species": edit_species.strip(),
+                                "lineage": edit_lineage.strip(),
+                                "parents": edit_parents.strip(),
+                                "generation": edit_generation.strip(),
+                                "father_id": edit_father_id.strip(),
+                                "mother_id": edit_mother_id.strip(),
+                                "initial_stage": edit_initial_stage,
+                                "current_stage": edit_current_stage,
+                                "harvest_date": edit_harvest_date.strftime("%Y-%m-%d"),
+                                "quantity": int(edit_quantity),
+                                "maintenance_days": int(edit_maintenance_days),
+                                "notes": edit_notes.strip(),
+                            }
+                            supabase.table("larvae_batches").update(payload).eq("id", batch.get("id")).execute()
+                            st.session_state.larvae_batch_action = None
+                            st.session_state.larvae_batch_edit_id = None
+                            st.success("幼蟲批次已更新。")
+                            st.rerun()
+
+# ==========================================
+# 頁面 4: 個體清單與檔案管理
 # ==========================================
 elif menu == "個體清單與檔案管理":
     st.title("個體清單與檔案管理")
