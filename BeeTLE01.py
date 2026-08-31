@@ -921,10 +921,6 @@ if menu == "全場總覽與待換土提醒":
             f"目前共有 **{len(pending_list)}** 隻個體已達到換土/維護條件！"
         )
         st.dataframe(pd.DataFrame(pending_list), use_container_width=True)
-    elif total_registered_beetles == 0:
-        st.info(
-            "目前資料庫中沒有任何有效的列管甲蟲資料，請前往「新增個體與成長紀錄」建立。"
-        )
     elif total_active_beetles == 0:
         st.info("目前列管資料皆為死亡個體，沒有需要換土/維護的活體。")
     else:
