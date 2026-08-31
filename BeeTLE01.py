@@ -761,7 +761,7 @@ if menu == "全場總覽與待換土提醒":
 
     ann_header_col1, ann_header_col2 = st.columns([8, 2])
     ann_header_col1.subheader("系統佈告欄")
-    if ann_header_col2.button("➕ 新增公告", use_container_width=True, type="primary"):
+    if ann_header_col2.button("新增公告", use_container_width=True, type="primary"):
         st.session_state.announcement_action = "add"
 
     res_ann = supabase.table("announcements").select("*").order("created_at", desc=True).execute()
