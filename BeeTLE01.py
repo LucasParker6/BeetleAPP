@@ -232,7 +232,8 @@ def get_pending_maintenance_records():
                 continue
 
             stage = batch.get("current_stage", "未設定")
-            if stage in ["蛹", "成蟲", "死亡"]:
+            status = batch.get("status", "開始") or "開始"
+            if status == "結束" or stage in ["蛹", "成蟲", "死亡"]:
                 continue
 
             target_days = batch.get("maintenance_days")
@@ -561,6 +562,10 @@ if "larvae_batch_action" not in st.session_state:
     st.session_state.larvae_batch_action = None
 if "larvae_batch_edit_id" not in st.session_state:
     st.session_state.larvae_batch_edit_id = None
+if "breeding_room_list_page" not in st.session_state:
+    st.session_state.breeding_room_list_page = 1
+if "larvae_batch_list_page" not in st.session_state:
+    st.session_state.larvae_batch_list_page = 1
 
 st.markdown(
     """
@@ -994,7 +999,31 @@ elif menu == "產房管理":
         if filtered_rooms.empty:
             st.info("查無符合條件的產房資料。")
         else:
-            for _, room in filtered_rooms.iterrows():
+            page_size = 10
+            total_pages = max(1, (len(filtered_rooms) + page_size - 1) // page_size)
+
+            def clear_breeding_room_action_on_page_change():
+                st.session_state.breeding_room_action = None
+                st.session_state.breeding_room_edit_id = None
+
+            current_page = min(
+                int(st.session_state.get("breeding_room_list_page", 1)),
+                total_pages,
+            )
+            page_number = st.number_input(
+                "頁次",
+                min_value=1,
+                max_value=total_pages,
+                value=current_page,
+                step=1,
+                key="breeding_room_list_page",
+                on_change=clear_breeding_room_action_on_page_change,
+            )
+            page_start = (page_number - 1) * page_size
+            page_df = filtered_rooms.iloc[page_start:page_start + page_size]
+            st.caption(f"第 {page_number} / {total_pages} 頁，共 {len(filtered_rooms)} 筆")
+
+            for _, room in page_df.iterrows():
                 with st.expander(f"{room.get('room_code', '未命名產房')}｜{room.get('status', '開始')}｜{room.get('start_date', '')}"):
                     c1, c2, c3 = st.columns(3)
                     c1.write(f"**產房編號：** {room.get('room_code', '-')}")
@@ -1070,10 +1099,11 @@ elif menu == "幼蟲管理":
             generation = c5.text_input("累代", placeholder="例: CBF1")
             father_id = c6.text_input("父 ID")
 
-            c7, c8, c9 = st.columns(3)
+            c7, c8, c9, c10 = st.columns(4)
             mother_id = c7.text_input("母 ID")
             initial_stage = c8.selectbox("初始階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"], index=0)
             current_stage = c9.selectbox("當前階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"], index=0)
+            status = c10.selectbox("狀態", ["開始", "結束"], index=0)
 
             c10, c11, c12 = st.columns(3)
             harvest_date = c10.date_input("孵化 / 採收日期", value=date.today())
@@ -1096,6 +1126,7 @@ elif menu == "幼蟲管理":
                         "mother_id": mother_id.strip(),
                         "initial_stage": initial_stage,
                         "current_stage": current_stage,
+                        "status": status,
                         "harvest_date": harvest_date.strftime("%Y-%m-%d"),
                         "quantity": int(quantity),
                         "maintenance_days": int(maintenance_days),
@@ -1111,10 +1142,61 @@ elif menu == "幼蟲管理":
     st.markdown("---")
     st.subheader("幼蟲批次列表")
 
-    if df_larvae.empty:
-        st.info("目前尚無任何幼蟲批次資料。")
+    larvae_keyword_col1, larvae_keyword_col2, larvae_keyword_col3 = st.columns([3, 3, 2])
+    larvae_keyword = larvae_keyword_col1.text_input(
+        "關鍵字搜尋",
+        placeholder="輸入批次編號或物種",
+        key="larvae_keyword",
+    )
+    larvae_status_filter = larvae_keyword_col2.selectbox(
+        "狀態篩選",
+        ["全部", "開始", "結束"],
+        index=0,
+        key="larvae_status_filter",
+    )
+
+    filtered_larvae = df_larvae.copy()
+    if "status" not in filtered_larvae.columns:
+        filtered_larvae["status"] = "開始"
+    if larvae_keyword.strip():
+        keyword_lower = larvae_keyword.strip().lower()
+        filtered_larvae = filtered_larvae[
+            filtered_larvae["batch_code"].fillna("").astype(str).str.lower().str.contains(keyword_lower, na=False)
+            | filtered_larvae["species"].fillna("").astype(str).str.lower().str.contains(keyword_lower, na=False)
+        ]
+    if larvae_status_filter != "全部":
+        filtered_larvae = filtered_larvae[
+            filtered_larvae["status"].fillna("開始").astype(str) == larvae_status_filter
+        ]
+
+    if filtered_larvae.empty:
+        st.info("查無符合條件的幼蟲批次資料。")
     else:
-        for _, batch in df_larvae.iterrows():
+        page_size = 10
+        total_pages = max(1, (len(filtered_larvae) + page_size - 1) // page_size)
+
+        def clear_larvae_action_on_page_change():
+            st.session_state.larvae_batch_action = None
+            st.session_state.larvae_batch_edit_id = None
+
+        current_page = min(
+            int(st.session_state.get("larvae_batch_list_page", 1)),
+            total_pages,
+        )
+        page_number = st.number_input(
+            "頁次",
+            min_value=1,
+            max_value=total_pages,
+            value=current_page,
+            step=1,
+            key="larvae_batch_list_page",
+            on_change=clear_larvae_action_on_page_change,
+        )
+        page_start = (page_number - 1) * page_size
+        page_df = filtered_larvae.iloc[page_start:page_start + page_size]
+        st.caption(f"第 {page_number} / {total_pages} 頁，共 {len(filtered_larvae)} 筆")
+
+        for _, batch in page_df.iterrows():
             with st.expander(f"{batch.get('batch_code', '未命名批次')}｜{batch.get('species', '-') }｜{batch.get('current_stage', '一齡幼蟲')}"):
                 cols = st.columns(4)
                 cols[0].write(f"**批次編號：** {batch.get('batch_code', '-')}")
@@ -1132,7 +1214,8 @@ elif menu == "幼蟲管理":
                 c9.write(f"**孵化/採收日期：** {batch.get('harvest_date') or '-'}")
                 c10.write(f"**數量：** {batch.get('quantity') or 0}")
                 c11.write(f"**換土週期：** {batch.get('maintenance_days') or 60} 天")
-                c12.write(f"**備註：** {batch.get('notes') or '無'}")
+                c12.write(f"**狀態：** {batch.get('status') or '開始'}")
+                st.write(f"**備註：** {batch.get('notes') or '無'}")
 
                 edit_col, delete_col = st.columns(2)
                 if edit_col.button("編輯", key=f"edit_larvae_{batch.get('batch_code')}_{batch.get('id')}"):
@@ -1155,10 +1238,12 @@ elif menu == "幼蟲管理":
                         edit_generation = edit_c5.text_input("累代", value=batch.get("generation") or "")
                         edit_father_id = edit_c6.text_input("父 ID", value=batch.get("father_id") or "")
 
-                        edit_c7, edit_c8, edit_c9 = st.columns(3)
+                        edit_c7, edit_c8, edit_c9, edit_c10 = st.columns(4)
                         edit_mother_id = edit_c7.text_input("母 ID", value=batch.get("mother_id") or "")
                         edit_initial_stage = edit_c8.selectbox("初始階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"], index=["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹"].index(batch.get("initial_stage", "一齡幼蟲")))
                         edit_current_stage = edit_c9.selectbox("當前階段", ["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"], index=["一齡幼蟲", "二齡幼蟲", "三齡幼蟲", "前蛹", "蛹", "成蟲", "死亡"].index(batch.get("current_stage", "一齡幼蟲")))
+                        edit_status_val = batch.get("status", "開始") or "開始"
+                        edit_status = edit_c10.selectbox("狀態", ["開始", "結束"], index=["開始", "結束"].index(edit_status_val) if edit_status_val in ["開始", "結束"] else 0)
 
                         edit_c10, edit_c11, edit_c12 = st.columns(3)
                         initial_harvest = batch.get("harvest_date")
@@ -1179,6 +1264,7 @@ elif menu == "幼蟲管理":
                                 "mother_id": edit_mother_id.strip(),
                                 "initial_stage": edit_initial_stage,
                                 "current_stage": edit_current_stage,
+                                "status": edit_status,
                                 "harvest_date": edit_harvest_date.strftime("%Y-%m-%d"),
                                 "quantity": int(edit_quantity),
                                 "maintenance_days": int(edit_maintenance_days),
@@ -2039,7 +2125,7 @@ elif menu == "新增個體與成長紀錄":
         for form_key in create_form_keys:
             st.session_state.pop(form_key, None)
 
-    with st.form("create_beetle_full_form", clear_on_submit=True):
+    with st.form("create_beetle_full_form", clear_on_submit=True, enter_to_submit=False):
         st.subheader("1. 建立個體基本檔案")
 
         col1, col2, col3 = st.columns(3)
