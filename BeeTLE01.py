@@ -620,23 +620,36 @@ def clear_action_on_menu_change():
 
 
 menu_left, menu_center, menu_right = st.sidebar.columns([0.05, 0.9, 0.05])
-menu = menu_center.segmented_control(
-    "",
-    [
-        "全場總覽與待換土提醒",
-        "產房管理",
-        "幼蟲管理",
-        "個體清單與檔案管理",
-        "血統與族譜分析",
-        "新增個體與成長紀錄",
-        "QR Code 掃描與識別",
-        "通知管理",
-        "備份/匯入",
-    ],
-    default="全場總覽與待換土提醒",
-    key="main_menu",
-    on_change=clear_action_on_menu_change,
-)
+MENU_OPTIONS = [
+    "全場總覽與待換土提醒",
+    "產房管理",
+    "幼蟲管理",
+    "個體清單與檔案管理",
+    "血統與族譜分析",
+    "新增個體與成長紀錄",
+    "QR Code 掃描與識別",
+    "通知管理",
+    "備份/匯入",
+]
+DEFAULT_MENU = "全場總覽與待換土提醒"
+
+# 優先使用 segmented_control（較美觀），若部署環境不支援或渲染行為異常，退回到 selectbox
+try:
+    menu = menu_center.segmented_control(
+        "",
+        MENU_OPTIONS,
+        default=DEFAULT_MENU,
+        key="main_menu",
+        on_change=clear_action_on_menu_change,
+    )
+except Exception:
+    menu = st.sidebar.selectbox(
+        "",
+        MENU_OPTIONS,
+        index=MENU_OPTIONS.index(DEFAULT_MENU),
+        key="main_menu",
+        on_change=clear_action_on_menu_change,
+    )
 
 # ==========================================
 # 頁面 1: 全場總覽與待換土提醒
