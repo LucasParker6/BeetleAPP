@@ -612,85 +612,11 @@ st.markdown(
 
 st.sidebar.title("系統功能選單")
 
-# 手機版切換狀態初始化
-if "mobile_view" not in st.session_state:
-    st.session_state.mobile_view = False
-if "mobile_show_sidebar" not in st.session_state:
-    st.session_state.mobile_show_sidebar = False
-
-# 處理 query parameter 用於從 HTML 連結切換回桌面版
-# (query-parameter handling for desktop link removed)
-
-# responsive columns wrapper：在 mobile_view 時把所有 columns 轉為單欄 container
-_orig_columns = st.columns
-def responsive_columns(spec):
-    try:
-        mobile = bool(st.session_state.get("mobile_view"))
-    except Exception:
-        mobile = False
-    if mobile:
-        n = spec if isinstance(spec, int) else len(spec)
-        return [st.container() for _ in range(n)]
-    return _orig_columns(spec)
-
-# 覆蓋 st.columns 為 responsive_columns，使既有程式碼可自動響應手機版
-st.columns = responsive_columns
-
-# 右上角手機版按鈕（顯示在主區域的最上方右側）
-top_cols = st.columns([9, 1])
-with top_cols[1]:
-    toggle_label = "手機版" if not st.session_state.mobile_view else "桌面版"
-    if st.button(toggle_label, key="mobile_toggle"):
-        st.session_state.mobile_view = not st.session_state.mobile_view
-        # 隱藏側邊選單時重置 mobile_show_sidebar
-        if not st.session_state.mobile_view:
-            st.session_state.mobile_show_sidebar = False
-        st.rerun()
-
-# 若為手機版，注入針對性 CSS：隱藏側邊欄、縮窄主容器、強制元件滿寬
-if st.session_state.mobile_view:
-    if st.session_state.mobile_show_sidebar:
-        # 顯示側邊欄並加遮罩
-        st.markdown(
-            """
-            <style>
-            section[data-testid="stSidebar"] { display: block !important; position: fixed !important; left: 0; top: 0; height: 100vh !important; width: 85% !important; max-width: 340px !important; z-index: 9999 !important; background: var(--background); }
-            div.block-container { max-width: 420px !important; padding-left: 12px !important; padding-right: 12px !important; }
-            /* Ensure main content doesn't overlap sidebar */
-            section[data-testid="stMain"] { margin-left: 0 !important; }
-            button[data-testid="stButton"] { width: 100% !important; }
-            </style>
-            <div id="mobile-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:9998;"></div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        # 隱藏側邊欄
-        st.markdown(
-            """
-            <style>
-            section[data-testid="stSidebar"] { display: none !important; }
-            div.block-container { max-width: 420px !important; padding-left: 12px !important; padding-right: 12px !important; }
-            div.row-widget.stColumns, div.css-1lcbmhc.e16nr0p31 { flex-direction: column !important; }
-            section[data-testid="stMain"] div[data-testid="column"] { width: 100% !important; }
-            button[data-testid="stButton"] { width: 100% !important; }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-    # (desktop button positioning and JS overlay removed)
-
 def clear_action_on_menu_change():
     st.session_state.current_action = None
     st.session_state.edit_target_code = None
     st.session_state.announcement_action = None
     st.session_state.target_announcement = None
-    # 若為手機版，切換功能後自動關閉側邊選單
-    try:
-        if st.session_state.get("mobile_view"):
-            st.session_state.mobile_show_sidebar = False
-    except Exception:
-        pass
 
 
 menu_left, menu_center, menu_right = st.sidebar.columns([0.05, 0.9, 0.05])
@@ -889,11 +815,11 @@ if menu == "全場總覽與待換土提醒":
                 st.write(ann.get('content', ""))
                 
                 btn_col1, btn_col2, _ = st.columns([1, 1, 8])
-                if btn_col1.button("編輯", key=f"edit_ann_{ann['id']}", use_container_width=True):
+                if btn_col1.button("編輯", key=f"edit_ann_{ann['id']}"):
                     st.session_state.announcement_action = "edit"
                     st.session_state.target_announcement = ann
                     st.rerun()
-                if btn_col2.button("刪除", key=f"del_ann_{ann['id']}", use_container_width=True):
+                if btn_col2.button("刪除", key=f"del_ann_{ann['id']}"):
                     st.session_state.announcement_action = "delete"
                     st.session_state.target_announcement = ann
                     st.rerun()
@@ -1145,10 +1071,10 @@ elif menu == "產房管理":
                     c6.write(f"**備註：** {room.get('notes') or '無'}")
 
                     edit_col, delete_col = st.columns(2)
-                    if edit_col.button("編輯", key=f"edit_room_{room.get('room_code')}_{room.get('id')}", use_container_width=True):
+                    if edit_col.button("編輯", key=f"edit_room_{room.get('room_code')}_{room.get('id')}"):
                         st.session_state.breeding_room_action = "edit"
                         st.session_state.breeding_room_edit_id = room.get("id")
-                    if delete_col.button("刪除", key=f"delete_room_{room.get('room_code')}_{room.get('id')}", use_container_width=True):
+                    if delete_col.button("刪除", key=f"delete_room_{room.get('room_code')}_{room.get('id')}"):
                         supabase.table("breeding_rooms").delete().eq("id", room.get("id")).execute()
                         st.success("產房資料已刪除。")
                         st.rerun()
@@ -1328,10 +1254,10 @@ elif menu == "幼蟲管理":
                 st.write(f"**備註：** {batch.get('notes') or '無'}")
 
                 edit_col, delete_col = st.columns(2)
-                if edit_col.button("編輯", key=f"edit_larvae_{batch.get('batch_code')}_{batch.get('id')}", use_container_width=True):
+                if edit_col.button("編輯", key=f"edit_larvae_{batch.get('batch_code')}_{batch.get('id')}"):
                     st.session_state.larvae_batch_action = "edit"
                     st.session_state.larvae_batch_edit_id = batch.get("id")
-                if delete_col.button("刪除", key=f"delete_larvae_{batch.get('batch_code')}_{batch.get('id')}", use_container_width=True):
+                if delete_col.button("刪除", key=f"delete_larvae_{batch.get('batch_code')}_{batch.get('id')}"):
                     supabase.table("larvae_batches").delete().eq("id", batch.get("id")).execute()
                     st.success("幼蟲批次已刪除。")
                     st.rerun()
@@ -1537,7 +1463,7 @@ elif menu == "個體清單與檔案管理":
                 if action_cols[0].button("查看", key=f"view_{action_key}", use_container_width=True):
                     st.session_state.current_action = "view"
                     st.session_state.edit_target_code = row_code
-                if action_cols[1].button("編輯", key=f"edit_{action_key}", use_container_width=True):
+                if action_cols[1].button("編輯", key=f"edit_{action_key}"):
                     st.session_state.current_action = "edit"
                     st.session_state.edit_target_code = row_code
                     existing_logs_cnt = (
@@ -1552,7 +1478,7 @@ elif menu == "個體清單與檔案管理":
                 if action_cols[3].button("血統", key=f"pedigree_{action_key}", use_container_width=True):
                     st.session_state.current_action = "pedigree"
                     st.session_state.edit_target_code = row_code
-                if action_cols[4].button("QR", key=f"qr_{action_key}", use_container_width=True):
+                if action_cols[4].button("QR", key=f"qr_{action_key}"):
                     st.session_state.current_action = "qr"
                     st.session_state.edit_target_code = row_code
                 if action_cols[5].button("刪除", key=f"delete_{action_key}", use_container_width=True):
