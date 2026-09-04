@@ -137,10 +137,12 @@ def get_pending_maintenance_records():
     res_b = supabase.table("beetles").select("*").execute() if table_exists("beetles") else None
     res_l = supabase.table("logs").select("*").execute() if table_exists("logs") else None
     res_larvae = supabase.table("larvae_batches").select("*").execute() if table_exists("larvae_batches") else None
+    res_rooms = supabase.table("breeding_rooms").select("*").execute() if table_exists("breeding_rooms") else None
 
     df_beetles = pd.DataFrame(res_b.data if res_b and res_b.data else [])
     df_logs = pd.DataFrame(res_l.data if res_l and res_l.data else [])
     df_larvae = pd.DataFrame(res_larvae.data if res_larvae and res_larvae.data else [])
+    df_rooms = pd.DataFrame(res_rooms.data if res_rooms and res_rooms.data else [])
     pending_list = []
 
     if not df_beetles.empty and "beetle_code" in df_beetles.columns:
@@ -151,16 +153,9 @@ def get_pending_maintenance_records():
 
         # 總列管數量只計算活體，明確排除 current_stage =「死亡」。
         # fillna + strip 可避免 NULL/空白資料造成篩選異常。
-        if "current_stage" in df_valid.columns:
-            stage_normalized = (
-                df_valid["current_stage"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-            )
-            df_active = df_valid[stage_normalized != "死亡"].copy()
-        else:
-            df_active = pd.DataFrame(columns=df_valid.columns)
+        df_active = df_valid.copy()
+        if "current_stage" in df_active.columns:
+            df_active = df_active[df_active["current_stage"].fillna("").astype(str).str.strip() != "死亡"]
 
         for _, beetle in df_active.iterrows():
             b_code = beetle.get("beetle_code")
@@ -729,6 +724,18 @@ if menu == "全場總覽與待換土提醒":
 
     larvae_batch_total = len(df_larvae) if not df_larvae.empty else 0
     pending_larvae_batches = 0
+    # 產房資料：若 Supabase 有此表則讀取，否則保留空 DataFrame
+    df_rooms = pd.DataFrame()
+    rooms_total = 0
+    pending_rooms = 0
+    if table_exists("breeding_rooms"):
+        try:
+            res_rooms_local = supabase.table("breeding_rooms").select("*").execute()
+            df_rooms = pd.DataFrame(res_rooms_local.data if res_rooms_local and res_rooms_local.data else [])
+            rooms_total = len(df_rooms) if not df_rooms.empty else 0
+        except Exception:
+            df_rooms = pd.DataFrame()
+            rooms_total = 0
     if not df_larvae.empty:
         for _, batch in df_larvae.iterrows():
             stage = batch.get("current_stage", "未設定")
@@ -747,15 +754,33 @@ if menu == "全場總覽與待換土提醒":
             if days_passed >= maintenance_days:
                 pending_larvae_batches += 1
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    # 概況指標（加入產房批次數量）
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("總列管數量 (活體)", f"{total_active_beetles} 隻")
     col2.metric("幼蟲數量", f"{larvae_cnt} 隻")
     col3.metric("化蛹數量", f"{pupa_cnt} 隻")
     col4.metric("成蟲數量", f"{adult_cnt} 隻")
     col5.metric("幼蟲批次數量", f"{larvae_batch_total} 批")
+    col6.metric("產房數量", f"{rooms_total} 間")
 
     if pending_larvae_batches:
         st.warning(f"目前有 **{pending_larvae_batches}** 個幼蟲批次達到換土/維護條件，請至「幼蟲管理」頁面檢視。")
+
+    # 產房到期提醒：若結束日期已到或已過，顯示提醒
+    if not df_rooms.empty and "end_date" in df_rooms.columns:
+        for _, room in df_rooms.iterrows():
+            end_date = room.get("end_date")
+            if not end_date:
+                continue
+            try:
+                end_dt = datetime.strptime(str(end_date), "%Y-%m-%d").date()
+                if end_dt <= date.today():
+                    pending_rooms += 1
+            except (TypeError, ValueError):
+                continue
+
+    if pending_rooms:
+        st.warning(f"目前有 **{pending_rooms}** 間產房已到達/超過結束日期，請至「產房管理」頁面檢視與處理。")
 
     st.markdown("---")
 
@@ -767,12 +792,23 @@ if menu == "全場總覽與待換土提醒":
     res_ann = supabase.table("announcements").select("*").order("created_at", desc=True).execute()
     announcements = res_ann.data if res_ann.data else []
 
+    # 公告清單分頁：每頁 10 筆
+    page_size = 10
+    total_pages = max(1, (len(announcements) + page_size - 1) // page_size)
+    if "announcement_page" not in st.session_state:
+        st.session_state.announcement_page = 1
+
+    ann_page = st.number_input("公告頁次", min_value=1, max_value=total_pages, value=min(st.session_state.announcement_page, total_pages), step=1, key="announcement_page")
+    st.caption(f"第 {ann_page} / {total_pages} 頁，共 {len(announcements)} 筆公告")
+
     if not announcements:
         st.info("目前尚無任何公告。")
     else:
-        for ann in announcements:
+        start_idx = (ann_page - 1) * page_size
+        end_idx = start_idx + page_size
+        for ann in announcements[start_idx:end_idx]:
             with st.expander(f"{ann.get('title', '無標題')} ({ann.get('created_at', '')[:10]})"):
-                st.write(ann.get("content", ""))
+                st.write(ann.get('content', ""))
                 
                 btn_col1, btn_col2, _ = st.columns([1, 1, 8])
                 if btn_col1.button("編輯", key=f"edit_ann_{ann['id']}"):
@@ -943,7 +979,7 @@ elif menu == "產房管理":
     if not table_exists("breeding_rooms"):
         st.warning("目前 Supabase 尚未建立 breeding_rooms 資料表，請先在資料庫中執行建立 SQL 後再使用此功能。")
     else:
-        with st.form("breeding_room_add_form"):
+        with st.form("breeding_room_add_form", clear_on_submit=True):
             st.subheader("新增產房")
             room_cols = st.columns(3)
             room_code = room_cols[0].text_input("產房編號 (必填)", placeholder="例: ROOM-2026-01")
@@ -1083,7 +1119,7 @@ elif menu == "幼蟲管理":
     if not table_exists("larvae_batches"):
         st.warning("目前 Supabase 尚未建立 larvae_batches 資料表，請先在資料庫中執行建立 SQL 後再使用此功能。")
     else:
-        with st.form("larvae_batch_add_form"):
+        with st.form("larvae_batch_add_form", clear_on_submit=True):
             st.subheader("新增幼蟲批次")
             c1, c2, c3 = st.columns(3)
             batch_code = c1.text_input("批次編號 (必填)", placeholder="例: LARV-2026-01")
