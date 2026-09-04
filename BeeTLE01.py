@@ -1487,7 +1487,7 @@ elif menu == "個體清單與檔案管理":
                 # 第二行按鈕
                 col5, col6, col7, col8 = st.columns(4)
                 
-                if col5.button("QR", key=f"qr_{action_key}", use_container_width=True):
+                if col5.button("QR Code", key=f"qr_{action_key}", use_container_width=True):
                     st.session_state.current_action = "qr"
                     st.session_state.edit_target_code = row_code
                     st.rerun()
