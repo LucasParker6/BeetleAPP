@@ -636,25 +636,8 @@ def responsive_columns(spec):
 # 覆蓋 st.columns 為 responsive_columns，使既有程式碼可自動響應手機版
 st.columns = responsive_columns
 
-# 在側邊欄內提供一個關閉按鈕（行動版開啟側邊欄時可用）
-if st.session_state.get("mobile_view") and st.session_state.get("mobile_show_sidebar"):
-    if st.sidebar.button("關閉選單", key="close_sidebar_in_sidebar"):
-        st.session_state.mobile_show_sidebar = False
-        st.rerun()
-
 # 右上角手機版按鈕（顯示在主區域的最上方右側）
 top_cols = st.columns([9, 1])
-with top_cols[0]:
-    # 在手機版顯示開啟/關閉側邊選單按鈕
-    if st.session_state.mobile_view:
-        if not st.session_state.mobile_show_sidebar:
-            if st.button("開啟選單", key="open_sidebar_mobile"):
-                st.session_state.mobile_show_sidebar = True
-                st.rerun()
-        else:
-            if st.button("關閉選單", key="close_sidebar_mobile"):
-                st.session_state.mobile_show_sidebar = False
-                st.rerun()
 with top_cols[1]:
     toggle_label = "手機版" if not st.session_state.mobile_view else "桌面版"
     if st.button(toggle_label, key="mobile_toggle"):
