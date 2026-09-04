@@ -633,11 +633,11 @@ MENU_OPTIONS = [
 ]
 DEFAULT_MENU = "全場總覽與待換土提醒"
 
-# 為了在 Streamlit Cloud 上保證所有選項可見，使用垂直顯示的 radio 控件
-menu = st.sidebar.radio(
-    "",
+# 使用側邊欄下拉式選單（selectbox）作為主要導航控制，較為簡潔且穩定
+menu = st.sidebar.selectbox(
+    "選擇功能",
     MENU_OPTIONS,
-    index=MENU_OPTIONS.index(DEFAULT_MENU),
+    index=(MENU_OPTIONS.index(st.session_state.get("main_menu")) if st.session_state.get("main_menu") in MENU_OPTIONS else MENU_OPTIONS.index(DEFAULT_MENU)),
     key="main_menu",
     on_change=clear_action_on_menu_change,
 )
