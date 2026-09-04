@@ -1337,7 +1337,9 @@ elif menu == "個體清單與檔案管理":
         st.session_state.edit_target_code = None
         st.session_state.beetle_list_page = 1
 
-    search_col1, search_col2, search_col3, search_col4 = st.columns(4)
+    # 響應式搜尋欄 - 在手機上堆疊，桌面上並排
+    st.markdown("### 搜尋條件")
+    search_col1, search_col2 = st.columns(2)
     search_id = search_col1.text_input(
         "ID 搜尋",
         placeholder="輸入 ID",
@@ -1350,6 +1352,7 @@ elif menu == "個體清單與檔案管理":
         key="beetle_search_species",
         on_change=clear_list_search_state,
     )
+    search_col3, search_col4 = st.columns(2)
     search_gender = search_col3.selectbox(
         "性別搜尋",
         ["全部", "未確定", "公", "母"],
@@ -1400,7 +1403,6 @@ elif menu == "個體清單與檔案管理":
             c for c in target_display_cols if c in df_valid.columns
         ]
 
-        st.markdown("### 個體操作選項")
         page_size = 10
         total_pages = max(1, (len(df_valid) + page_size - 1) // page_size)
 
@@ -1424,46 +1426,44 @@ elif menu == "個體清單與檔案管理":
         page_df = df_valid.iloc[page_start : page_start + page_size]
         st.caption(f"第 {page_number} / {total_pages} 頁，共 {len(df_valid)} 筆")
 
-        header_cols = st.columns(
-            [1.5, 1, 1.7, 0.7, 1.1, 1.3, 1.2, 1.2, 5]
-        )
-        for header_col, header in zip(
-            header_cols,
-            [
-                "個體編號",
-                "ID",
-                "物種",
-                "性別",
-                "取得來源",
-                "當前階段",
-                "血統",
-                "孵化/採收日期",
-                "操作選項",
-            ],
-        ):
-            header_col.markdown(f"**{header}**")
-
+        # 卡片式設計 - 優化手機顯示
         for row_number, (_, beetle) in enumerate(page_df.iterrows()):
             row_code = beetle["beetle_code"]
-            row_cols = st.columns(
-                [1.5, 1, 1.7, 0.7, 1.1, 1.3, 1.2, 1.2, 5]
-            )
-            row_cols[0].write(row_code)
-            row_cols[1].write(beetle.get("custom_id") or "-")
-            row_cols[2].write(beetle.get("species") or "-")
-            row_cols[3].write(beetle.get("gender") or "-")
-            row_cols[4].write(beetle.get("acquisition_source") or "-")
-            row_cols[5].write(beetle.get("current_stage") or "-")
-            row_cols[6].write(beetle.get("lineage") or "-")
-            row_cols[7].write(beetle.get("hatch_date") or "-")
-
             action_key = f"beetle_{page_start + row_number}_{row_code}"
-            with row_cols[8].popover("操作選項"):
-                action_cols = st.columns(7)
-                if action_cols[0].button("查看", key=f"view_{action_key}", use_container_width=True):
+            
+            # 使用容器建立卡片效果
+            with st.container(border=True):
+                # 卡片標題（個體編號和物種）
+                title_col1, title_col2 = st.columns([2, 3])
+                title_col1.markdown(f"### {row_code}")
+                title_col2.write(f"{beetle.get('species') or '-'}")
+                
+                st.markdown("---")
+                
+                # 基本資訊 - 使用兩列佈局
+                info_col1, info_col2 = st.columns(2)
+                
+                with info_col1:
+                    st.write(f"**ID:** {beetle.get('custom_id') or '-'}")
+                    st.write(f"**性別:** {beetle.get('gender') or '-'}")
+                    st.write(f"**取得來源:** {beetle.get('acquisition_source') or '-'}")
+                
+                with info_col2:
+                    st.write(f"**當前階段:** {beetle.get('current_stage') or '-'}")
+                    st.write(f"**血統:** {beetle.get('lineage') or '-'}")
+                    st.write(f"**孵化/採收日期:** {beetle.get('hatch_date') or '-'}")
+                
+                st.markdown("---")
+                
+                # 操作按鈕 - 手機友好的佈局
+                col1, col2, col3, col4 = st.columns(4)
+                
+                if col1.button("查看", key=f"view_{action_key}", use_container_width=True):
                     st.session_state.current_action = "view"
                     st.session_state.edit_target_code = row_code
-                if action_cols[1].button("編輯", key=f"edit_{action_key}"):
+                    st.rerun()
+                    
+                if col2.button("編輯", key=f"edit_{action_key}", use_container_width=True):
                     st.session_state.current_action = "edit"
                     st.session_state.edit_target_code = row_code
                     existing_logs_cnt = (
@@ -1472,21 +1472,40 @@ elif menu == "個體清單與檔案管理":
                         else 0
                     )
                     st.session_state.edit_log_rows = max(1, existing_logs_cnt)
-                if action_cols[2].button("曲線", key=f"chart_{action_key}", use_container_width=True):
+                    st.rerun()
+                    
+                if col3.button("曲線", key=f"chart_{action_key}", use_container_width=True):
                     st.session_state.current_action = "chart"
                     st.session_state.edit_target_code = row_code
-                if action_cols[3].button("血統", key=f"pedigree_{action_key}", use_container_width=True):
+                    st.rerun()
+                    
+                if col4.button("血統", key=f"pedigree_{action_key}", use_container_width=True):
                     st.session_state.current_action = "pedigree"
                     st.session_state.edit_target_code = row_code
-                if action_cols[4].button("QR", key=f"qr_{action_key}"):
+                    st.rerun()
+                
+                # 第二行按鈕
+                col5, col6, col7, col8 = st.columns(4)
+                
+                if col5.button("QR", key=f"qr_{action_key}", use_container_width=True):
                     st.session_state.current_action = "qr"
                     st.session_state.edit_target_code = row_code
-                if action_cols[5].button("刪除", key=f"delete_{action_key}", use_container_width=True):
-                    st.session_state.current_action = "delete"
-                    st.session_state.edit_target_code = row_code
-                if action_cols[6].button("圖片", key=f"images_{action_key}", use_container_width=True):
+                    st.rerun()
+                    
+                if col6.button("圖片", key=f"images_{action_key}", use_container_width=True):
                     st.session_state.current_action = "images"
                     st.session_state.edit_target_code = row_code
+                    st.rerun()
+                    
+                if col7.button("詳情", key=f"details_{action_key}", use_container_width=True):
+                    st.session_state.current_action = "view"
+                    st.session_state.edit_target_code = row_code
+                    st.rerun()
+                    
+                if col8.button("刪除", key=f"delete_{action_key}", use_container_width=True):
+                    st.session_state.current_action = "delete"
+                    st.session_state.edit_target_code = row_code
+                    st.rerun()
 
         @st.dialog("個體操作")
         def render_action_dialog():
@@ -1498,44 +1517,38 @@ elif menu == "個體清單與檔案管理":
 
                 if st.session_state.get("current_action") == "view":
                     st.info(f"個體詳細檔案：{active_code}")
-                    v_col1, v_col2, v_col3 = st.columns(3)
-                    v_col1.write(f"**個體編號:** {selected_info.get('beetle_code')}")
-                    v_col1.write(f"**ID:** {selected_info.get('custom_id', '無')}")
-                    v_col1.write(f"**物種名稱:** {selected_info.get('species')}")
-                    v_col1.write(f"**性別:** {selected_info.get('gender')}")
-
-                    v_col2.write(f"**產地:** {selected_info.get('origin') or '無'}")
-                    v_col2.write(
-                        f"**取得來源:** {selected_info.get('acquisition_source') or '無'}"
-                    )
-                    v_col2.write(
-                        f"**初始階段:** {selected_info.get('initial_stage') or '無'}"
-                    )
-                    v_col2.write(
-                        f"**當前階段:** {selected_info.get('current_stage') or '無'}"
-                    )
-                    v_col2.write(
-                        f"**孵化/採收日期:** {selected_info.get('hatch_date') or '無'}"
-                    )
-
-                    v_col3.write(
-                        f"**親代:** {selected_info.get('parents_info') or '無'}"
-                    )
-                    v_col3.write(
-                        f"**累代:** {selected_info.get('generation') or '無'}"
-                    )
-                    v_col3.write(
-                        f"**血統:** {selected_info.get('lineage') or '無'}"
-                    )
+                    # 優化手機顯示 - 垂直排列而不是 3 列
+                    st.markdown("**基本資訊**")
+                    col_left, col_right = st.columns(2)
                     
-                    f_id_val = selected_info.get('father_id', '')
-                    m_id_val = selected_info.get('mother_id', '')
-                    formatted_parents = format_parent_display(f_id_val, m_id_val)
-                    v_col3.write(f"**父/母 ID:** {formatted_parents}")
+                    with col_left:
+                        st.write(f"**個體編號:** {selected_info.get('beetle_code')}")
+                        st.write(f"**ID:** {selected_info.get('custom_id', '無')}")
+                        st.write(f"**物種名稱:** {selected_info.get('species')}")
+                        st.write(f"**性別:** {selected_info.get('gender')}")
+                        st.write(f"**初始階段:** {selected_info.get('initial_stage') or '無'}")
+                    
+                    with col_right:
+                        st.write(f"**產地:** {selected_info.get('origin') or '無'}")
+                        st.write(f"**取得來源:** {selected_info.get('acquisition_source') or '無'}")
+                        st.write(f"**當前階段:** {selected_info.get('current_stage') or '無'}")
+                        st.write(f"**孵化/採收日期:** {selected_info.get('hatch_date') or '無'}")
+                    
+                    st.markdown("**血統資訊**")
+                    col_pedigree_left, col_pedigree_right = st.columns(2)
+                    
+                    with col_pedigree_left:
+                        st.write(f"**親代:** {selected_info.get('parents_info') or '無'}")
+                        st.write(f"**累代:** {selected_info.get('generation') or '無'}")
+                    
+                    with col_pedigree_right:
+                        st.write(f"**血統:** {selected_info.get('lineage') or '無'}")
+                        f_id_val = selected_info.get('father_id', '')
+                        m_id_val = selected_info.get('mother_id', '')
+                        formatted_parents = format_parent_display(f_id_val, m_id_val)
+                        st.write(f"**父/母 ID:** {formatted_parents}")
 
-                    st.write(
-                        f"**個體換土提醒週期:** {selected_info.get('custom_maintenance_days') or 60} 天"
-                    )
+                    st.write(f"**個體換土提醒週期:** {selected_info.get('custom_maintenance_days') or 60} 天")
                     st.write(f"**備註:** {selected_info.get('notes') or '無'}")
 
                     b_logs = pd.DataFrame()
@@ -1575,7 +1588,8 @@ elif menu == "個體清單與檔案管理":
 
                     with st.form("edit_beetle_form_stable"):
                         st.markdown("##### 基本資訊編輯")
-                        e_c1, e_c2, e_c3 = st.columns(3)
+                        # 優化手機顯示 - 改為 2 列而不是 3 列
+                        e_c1, e_c2 = st.columns(2)
                         edit_beetle_code = e_c1.text_input(
                             "個體編號 (主鍵, 必填)",
                             selected_info.get("beetle_code", ""),
@@ -1583,7 +1597,7 @@ elif menu == "個體清單與檔案管理":
                         edit_custom_id = e_c2.text_input(
                             "ID (必填)", selected_info.get("custom_id", "")
                         )
-                        edit_species = e_c3.text_input(
+                        edit_species = st.text_input(
                             "物種名稱 (必填)", selected_info.get("species", "")
                         )
 
@@ -1593,8 +1607,8 @@ elif menu == "個體清單與檔案管理":
                             if gender_val in ["未確定", "公", "母"]
                             else 0
                         )
-                        e_c4, e_c5, e_c6 = st.columns(3)
-                        edit_gender = e_c4.selectbox(
+                        e_c3, e_c4 = st.columns(2)
+                        edit_gender = e_c3.selectbox(
                             "性別", ["未確定", "公", "母"], index=gender_idx
                         )
 
@@ -1612,7 +1626,7 @@ elif menu == "個體清單與檔案管理":
                         stage_idx = (
                             stages.index(stage_val) if stage_val in stages else 0
                         )
-                        edit_stage = e_c5.selectbox(
+                        edit_stage = e_c4.selectbox(
                             "當前階段", stages, index=stage_idx
                         )
 
@@ -1622,15 +1636,15 @@ elif menu == "個體清單與檔案管理":
                             if init_stage_val in stages
                             else 0
                         )
-                        edit_initial_stage = e_c6.selectbox(
+                        edit_initial_stage = st.selectbox(
                             "初始階段", stages, index=init_stage_idx
                         )
 
-                        e_c7, e_c8, e_c9 = st.columns(3)
-                        edit_origin = e_c7.text_input(
+                        e_c5, e_c6 = st.columns(2)
+                        edit_origin = e_c5.text_input(
                             "產地", selected_info.get("origin") or ""
                         )
-                        edit_acquisition_source = st.text_input(
+                        edit_acquisition_source = e_c6.text_input(
                             "取得來源 (選填)",
                             selected_info.get("acquisition_source") or "",
                         )
@@ -1647,23 +1661,25 @@ elif menu == "個體清單與檔案管理":
                         except Exception:
                             curr_hatch_dt = date.today()
 
-                        edit_hatch_date = e_c8.date_input(
+                        edit_hatch_date = st.date_input(
                             "孵化/採收日期", curr_hatch_dt
                         )
-                        edit_parents_info = e_c9.text_input(
+                        
+                        e_c7, e_c8 = st.columns(2)
+                        edit_parents_info = e_c7.text_input(
                             "親代", selected_info.get("parents_info") or ""
                         )
-
-                        e_c10, e_c11, e_c12 = st.columns(3)
-                        edit_generation = e_c10.text_input(
+                        edit_generation = e_c8.text_input(
                             "累代", selected_info.get("generation") or ""
                         )
-                        edit_lineage = e_c11.text_input(
+                        
+                        e_c9, e_c10 = st.columns(2)
+                        edit_lineage = e_c9.text_input(
                             "血統", selected_info.get("lineage") or ""
                         )
                         cur_m_days = selected_info.get("custom_maintenance_days")
-                        edit_m_days = e_c12.number_input(
-                            "個體換土提醒週期 (天)",
+                        edit_m_days = e_c10.number_input(
+                            "換土提醒週期 (天)",
                             value=(
                                 int(cur_m_days)
                                 if pd.notnull(cur_m_days) and cur_m_days
@@ -1672,16 +1688,16 @@ elif menu == "個體清單與檔案管理":
                             step=5,
                         )
 
-                        e_c13, e_c14 = st.columns(2)
-                        edit_father_id = e_c13.text_input(
+                        e_c11, e_c12 = st.columns(2)
+                        edit_father_id = e_c11.text_input(
                             "父本 ID", selected_info.get("father_id") or ""
                         )
-                        edit_mother_id = e_c14.text_input(
+                        edit_mother_id = e_c12.text_input(
                             "母本 ID", selected_info.get("mother_id") or ""
                         )
 
                         edit_notes = st.text_area(
-                            "備註", selected_info.get("notes") or ""
+                            "備註", selected_info.get("notes") or "", height=100
                         )
 
                         st.markdown("---")
@@ -1705,66 +1721,69 @@ elif menu == "個體清單與檔案管理":
                             log_item = (
                                 b_logs_list[i] if i < len(b_logs_list) else {}
                             )
-                            lc1, lc2, lc3, lc4, lc5 = st.columns(
-                                [1.6, 1.6, 1.6, 1.5, 3]
-                            )
+                            
+                            # 使用 expander 來優化手機顯示
+                            with st.expander(f"紀錄 #{i+1} - {log_item.get('entry_date', '新增')}"):
+                                try:
+                                    def_date = (
+                                        datetime.strptime(
+                                            log_item.get("entry_date"), "%Y-%m-%d"
+                                        ).date()
+                                        if log_item.get("entry_date")
+                                        else date.today()
+                                    )
+                                except Exception:
+                                    def_date = date.today()
 
-                            try:
-                                def_date = (
-                                    datetime.strptime(
-                                        log_item.get("entry_date"), "%Y-%m-%d"
-                                    ).date()
-                                    if log_item.get("entry_date")
-                                    else date.today()
+                                l_date = st.date_input(
+                                    "日期", def_date, key=f"el_d_{i}"
                                 )
-                            except Exception:
-                                def_date = date.today()
+                                
+                                lc1, lc2 = st.columns(2)
+                                l_len = lc1.number_input(
+                                    "體長 (mm)",
+                                    min_value=0.0,
+                                    value=float(log_item.get("length_mm") or 0.0),
+                                    step=0.1,
+                                    key=f"el_len_{i}",
+                                )
+                                l_wt = lc2.number_input(
+                                    "體重 (g)",
+                                    min_value=0.0,
+                                    value=float(log_item.get("weight_g") or 0.0),
+                                    step=0.1,
+                                    key=f"el_w_{i}",
+                                )
+                                
+                                legacy_maintenance = any(
+                                    keyword in str(log_item.get("notes") or "")
+                                    for keyword in ["換土", "換菌", "轉木屑"]
+                                )
+                                maintenance_default = (
+                                    log_item.get("maintenance_type") == "維護"
+                                    or legacy_maintenance
+                                )
+                                l_maintenance = st.checkbox(
+                                    "已換土/維護",
+                                    value=maintenance_default,
+                                    key=f"el_m_{i}",
+                                )
+                                
+                                l_note = st.text_input(
+                                    "備註",
+                                    value=str(log_item.get("notes") or ""),
+                                    key=f"el_n_{i}",
+                                )
 
-                            l_date = lc1.date_input(
-                                f"#{i+1}", def_date, key=f"el_d_{i}"
-                            )
-                            l_len = lc2.number_input(
-                                f"#{i+1}",
-                                min_value=0.0,
-                                value=float(log_item.get("length_mm") or 0.0),
-                                step=0.1,
-                                key=f"el_len_{i}",
-                            )
-                            l_wt = lc3.number_input(
-                                f"#{i+1}",
-                                min_value=0.0,
-                                value=float(log_item.get("weight_g") or 0.0),
-                                step=0.1,
-                                key=f"el_w_{i}",
-                            )
-                            legacy_maintenance = any(
-                                keyword in str(log_item.get("notes") or "")
-                                for keyword in ["換土", "換菌", "轉木屑"]
-                            )
-                            maintenance_default = (
-                                log_item.get("maintenance_type") == "維護"
-                                or legacy_maintenance
-                            )
-                            l_maintenance = lc4.checkbox(
-                                f"#{i+1}",
-                                value=maintenance_default,
-                                key=f"el_m_{i}",
-                            )
-                            l_note = lc5.text_input(
-                                f"#{i+1}",
-                                value=str(log_item.get("notes") or ""),
-                                key=f"el_n_{i}",
-                            )
-
-                            edited_logs.append(
-                                {
-                                    "date": l_date.strftime("%Y-%m-%d"),
-                                    "length": l_len if l_len > 0 else None,
-                                    "weight": l_wt if l_wt > 0 else None,
-                                    "maintenance": l_maintenance,
-                                    "notes": l_note,
-                                }
-                            )
+                                edited_logs.append(
+                                    {
+                                        "date": l_date.strftime("%Y-%m-%d"),
+                                        "length": l_len if l_len > 0 else None,
+                                        "weight": l_wt if l_wt > 0 else None,
+                                        "maintenance": l_maintenance,
+                                        "notes": l_note,
+                                    }
+                                )
 
                         st.markdown("---")
 
