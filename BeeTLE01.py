@@ -9,6 +9,7 @@ from PIL import Image
 import qrcode
 import streamlit as st
 import altair as alt
+import httpx
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 import cv2
@@ -43,19 +44,61 @@ BACKUP_REQUIRED_TABLES = [
 # ==========================================
 # 2. Supabase 資料庫操作與備份機制
 # ==========================================
+def _is_missing_table_error(message: str) -> bool:
+    lower_message = message.lower()
+    return (
+        "could not find the table" in lower_message
+        or "pgrst205" in lower_message
+        or "does not exist" in lower_message
+        or ("relation" in lower_message and "does not exist" in lower_message)
+    )
+
+
+def _is_transient_connection_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if isinstance(
+        exc,
+        (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.TimeoutException,
+        ),
+    ):
+        return True
+    return any(
+        marker in message
+        for marker in [
+            "server disconnected",
+            "remote protocol",
+            "connection reset by peer",
+            "connection aborted",
+            "broken pipe",
+            "unexpected eof",
+            "read eof",
+            "network is unreachable",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "transport error",
+            "connection closed",
+            "connection error",
+            "connection pool is full",
+        ]
+    )
+
+
 def table_exists(table_name: str) -> bool:
-    """檢查 Supabase 中指定資料表是否存在，避免未建立表格造成頁面直接崩潰。"""
+    """檢查 Supabase 中指定資料表是否存在，避免未建立表格或暫時斷線造成頁面直接崩潰。"""
     try:
         supabase.table(table_name).select("id").limit(1).execute()
         return True
     except Exception as exc:
         message = str(exc)
-        if (
-            "Could not find the table" in message
-            or "PGRST205" in message
-            or "does not exist" in message.lower()
-            or "relation" in message.lower() and "does not exist" in message.lower()
-        ):
+        if _is_missing_table_error(message):
+            return False
+        if _is_transient_connection_error(exc):
             return False
         raise
 
