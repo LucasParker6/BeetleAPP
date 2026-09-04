@@ -633,23 +633,14 @@ MENU_OPTIONS = [
 ]
 DEFAULT_MENU = "全場總覽與待換土提醒"
 
-# 優先使用 segmented_control（較美觀），若部署環境不支援或渲染行為異常，退回到 selectbox
-try:
-    menu = menu_center.segmented_control(
-        "",
-        MENU_OPTIONS,
-        default=DEFAULT_MENU,
-        key="main_menu",
-        on_change=clear_action_on_menu_change,
-    )
-except Exception:
-    menu = st.sidebar.selectbox(
-        "",
-        MENU_OPTIONS,
-        index=MENU_OPTIONS.index(DEFAULT_MENU),
-        key="main_menu",
-        on_change=clear_action_on_menu_change,
-    )
+# 為了在 Streamlit Cloud 上保證所有選項可見，使用垂直顯示的 radio 控件
+menu = st.sidebar.radio(
+    "",
+    MENU_OPTIONS,
+    index=MENU_OPTIONS.index(DEFAULT_MENU),
+    key="main_menu",
+    on_change=clear_action_on_menu_change,
+)
 
 # ==========================================
 # 頁面 1: 全場總覽與待換土提醒
